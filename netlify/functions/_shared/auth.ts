@@ -1,13 +1,27 @@
 import { getUser } from "@netlify/identity";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../../../db";
 import { aiUsage, userEntitlements } from "../../../db/schema";
 
 export type AppUser = { id: string; email?: string; development: boolean };
 
+export type AiQuotaResult = {
+  allowed: boolean;
+  used: number;
+  limit: number | null;
+};
+
 function env(name: string): string | undefined {
   if (typeof Netlify !== "undefined") return Netlify.env.get(name);
   return typeof process !== "undefined" ? process.env[name] : undefined;
+}
+
+function freeLimit(action: "decompose" | "replan"): number {
+  return action === "decompose" ? 3 : 1;
+}
+
+function usageDateUtc(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
 export async function requireUser(): Promise<AppUser | Response> {
@@ -80,18 +94,61 @@ export function createId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
-export async function consumeAiQuota(
+/**
+ * 只读检查今日是否还有额度，不扣次。
+ * mock / 超时兜底前应 peek；真实 AI 成功后再 commit。
+ */
+export async function peekAiQuota(
   userId: string,
   action: "decompose" | "replan",
   options?: { testerMode?: boolean },
-): Promise<{ allowed: boolean; used: number; limit: number | null }> {
+): Promise<AiQuotaResult> {
   if (options?.testerMode) return { allowed: true, used: 0, limit: null };
   const entitlement = await getEntitlement(userId);
   if (entitlement.pro) return { allowed: true, used: 0, limit: null };
 
-  const limit = action === "decompose" ? 3 : 1;
-  const usageDate = new Date().toISOString().slice(0, 10);
+  const limit = freeLimit(action);
+  const usageDate = usageDateUtc();
   try {
+    const [record] = await db
+      .select({ count: aiUsage.count })
+      .from(aiUsage)
+      .where(
+        and(
+          eq(aiUsage.userId, userId),
+          eq(aiUsage.usageDate, usageDate),
+          eq(aiUsage.action, action),
+        ),
+      )
+      .limit(1);
+    const used = Number(record?.count) || 0;
+    return { allowed: used < limit, used, limit };
+  } catch (error) {
+    console.error("AI 配额读取失败，按免费版拒绝以避免绕过限制", error);
+    return { allowed: false, used: limit, limit };
+  }
+}
+
+/**
+ * 真实 AI 成功后扣 1 次。已达上限则不再增加。
+ */
+export async function commitAiQuota(
+  userId: string,
+  action: "decompose" | "replan",
+  options?: { testerMode?: boolean },
+): Promise<AiQuotaResult> {
+  if (options?.testerMode) return { allowed: true, used: 0, limit: null };
+  const entitlement = await getEntitlement(userId);
+  if (entitlement.pro) return { allowed: true, used: 0, limit: null };
+
+  const limit = freeLimit(action);
+  const usageDate = usageDateUtc();
+  try {
+    const peek = await peekAiQuota(userId, action, options);
+    if (!peek.allowed) {
+      return peek;
+    }
+
     const [record] = await db
       .insert(aiUsage)
       .values({
@@ -104,15 +161,16 @@ export async function consumeAiQuota(
       .onConflictDoUpdate({
         target: [aiUsage.userId, aiUsage.usageDate, aiUsage.action],
         set: {
-          count: sql`${aiUsage.count} + 1`,
+          // 仅在未超限时 +1，避免并发把 used 顶到虚高
+          count: sql`CASE WHEN ${aiUsage.count} < ${limit} THEN ${aiUsage.count} + 1 ELSE ${aiUsage.count} END`,
           updatedAt: new Date(),
         },
       })
       .returning({ count: aiUsage.count });
-    const used = Number(record?.count) || 1;
+    const used = Number(record?.count) || peek.used + 1;
     return { allowed: used <= limit, used, limit };
   } catch (error) {
-    console.error("AI 配额校验失败，按免费版拒绝以避免绕过限制", error);
+    console.error("AI 配额写入失败", error);
     return { allowed: false, used: limit, limit };
   }
 }

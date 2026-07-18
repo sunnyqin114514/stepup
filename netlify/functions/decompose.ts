@@ -19,10 +19,11 @@ import { checkOrigin, createAiClient } from "./_shared/aiClient";
 import { buildFallbackStepsForTask } from "./_shared/taskDetail";
 import { sanitizeFullTask } from "./_shared/taskSanitize";
 import {
-  consumeAiQuota,
+  commitAiQuota,
   getRequestEntitlement,
   isAuthResponse,
   isTesterModeRequest,
+  peekAiQuota,
   requireUser,
 } from "./_shared/auth";
 
@@ -1007,9 +1008,8 @@ export default async (req: Request): Promise<Response> => {
       );
     }
   }
-  const quota = await consumeAiQuota(auth.id, "decompose", {
-    testerMode: isTesterModeRequest(req),
-  });
+  const testerMode = isTesterModeRequest(req);
+  const quota = await peekAiQuota(auth.id, "decompose", { testerMode });
   if (!quota.allowed) {
     return Response.json(
       { error: `今日 AI 拆解次数已用完（免费版每天 ${quota.limit} 次）` },
@@ -1189,6 +1189,8 @@ export default async (req: Request): Promise<Response> => {
       schedule: finalized.schedule,
       allocatedDailyMinutes: finalized.allocatedDailyMinutes,
     };
+    // 仅真实 AI 成功扣次；超时/场景兜底（mock）不烧免费额度
+    await commitAiQuota(auth.id, "decompose", { testerMode });
     return Response.json(result);
   } catch (err) {
     console.warn(

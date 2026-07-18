@@ -18,9 +18,10 @@ import { stripMarkdown } from "../../src/lib/textSanitize";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
 import { buildFallbackStepsForTask } from "./_shared/taskDetail";
 import {
-  consumeAiQuota,
+  commitAiQuota,
   isAuthResponse,
   isTesterModeRequest,
+  peekAiQuota,
   requireUser,
 } from "./_shared/auth";
 
@@ -581,9 +582,18 @@ export default async (req: Request): Promise<Response> => {
   ) {
     return Response.json({ error: "缺少计划数据" }, { status: 400 });
   }
-  const quota = await consumeAiQuota(auth.id, "replan", {
-    testerMode: isTesterModeRequest(req),
-  });
+  const instruction = String(body.difficulty ?? "").trim();
+  const unfinished = body.plan.tasks.filter((t) => !t.completed);
+  const budget = resolveBudget(body);
+
+  // 无具体指令：本地按标准节奏重排，不占 AI 重排额度
+  if (!hasConcreteInstruction(instruction)) {
+    const local = generateMockReplan(body);
+    return Response.json({ ...local, mock: false });
+  }
+
+  const testerMode = isTesterModeRequest(req);
+  const quota = await peekAiQuota(auth.id, "replan", { testerMode });
   if (!quota.allowed) {
     return Response.json(
       {
@@ -591,16 +601,6 @@ export default async (req: Request): Promise<Response> => {
       },
       { status: 429 },
     );
-  }
-
-  const instruction = String(body.difficulty ?? "").trim();
-  const unfinished = body.plan.tasks.filter((t) => !t.completed);
-  const budget = resolveBudget(body);
-
-  // 无具体指令：本地按标准节奏重排即可（保留 steps），不算演示模式
-  if (!hasConcreteInstruction(instruction)) {
-    const local = generateMockReplan(body);
-    return Response.json({ ...local, mock: false });
   }
 
   // 本地函数硬限约 30s：精简方案约 1–3s；留足预算让 API key 稳定打到 DeepSeek
@@ -690,7 +690,8 @@ export default async (req: Request): Promise<Response> => {
       ),
     ).slice(0, 60),
   };
-  // 真实走了 API key，不标 mock
+  // 真实走了 AI 才扣次；超时本地启发式（mock）不烧额度
+  await commitAiQuota(auth.id, "replan", { testerMode });
   return Response.json(result);
 };
 

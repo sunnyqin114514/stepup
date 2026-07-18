@@ -330,7 +330,10 @@ export default function PlannerPage() {
       const next = upsertPlan(newPlan);
       setWs(next);
       setCreatingNew(false);
-      incrementDecomposeCount();
+      // 与后端一致：仅真实 AI 成功计次，演示/兜底不烧本地免费额度
+      if (!res.mock) {
+        incrementDecomposeCount();
+      }
       setMockNotice(Boolean(res.mock));
       resetCalendarFocus(newPlan);
       const todayCount = tasks.filter((t) => t.date === todayStr()).length;
@@ -353,8 +356,13 @@ export default function PlannerPage() {
   const handleAdjust = async () => {
     if (!plan) return;
     setError(null);
-    // AI 重排次数检查（免费版每天 1 次）
-    if (!canReplan()) {
+    const instruction = adjustNote.trim();
+    // 空指令走本地重排，不占 AI 重排次数；有具体指令才检查额度
+    const needsAiQuota =
+      Boolean(instruction) &&
+      instruction !== "用户主动请求调整日程" &&
+      instruction !== "无（按默认规则重排）";
+    if (needsAiQuota && !canReplan()) {
       setError(
         `今日 AI 重排次数已用完（免费版每天 ${FREE_REPLAN_LIMIT} 次）。升级 Pro 可无限使用。`
       );
@@ -385,7 +393,7 @@ export default function PlannerPage() {
       const res = await replanPlan({
         plan: { ...plan, dailyMinutes },
         // 空指令 = 只重排日期；有指令才改写任务内容/步骤
-        difficulty: adjustNote.trim(),
+        difficulty: instruction,
         tomorrowMinutes: allocated,
         globalDailyCap: cap,
         allocatedDailyMinutes: allocated,
@@ -416,7 +424,9 @@ export default function PlannerPage() {
         schedule: res.schedule ?? plan.schedule,
       };
       setWs(upsertPlan(nextPlan));
-      incrementReplanCount();
+      if (needsAiQuota && !res.mock) {
+        incrementReplanCount();
+      }
       // 调整日程不再复用「演示模式」黄条；算法兜底也会真实改休息日
       setMockNotice(false);
       const restN = res.schedule?.restDates?.length ?? 0;
