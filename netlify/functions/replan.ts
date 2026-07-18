@@ -8,14 +8,15 @@ import type {
 import {
   buildDefaultSchedule,
   distributeTasksToWorkDates,
-  listExecutableDays,
   localDateStr,
+  resolveRestIntensity,
   snapToNextExecutableDay,
+  tightenScheduleToTasks,
+  type RestIntensity,
 } from "../../src/lib/scheduleDates";
 import { stripMarkdown } from "../../src/lib/textSanitize";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
 import { buildFallbackStepsForTask } from "./_shared/taskDetail";
-import { sanitizeFullTask } from "./_shared/taskSanitize";
 import {
   consumeAiQuota,
   isAuthResponse,
@@ -38,72 +39,174 @@ function hasConcreteInstruction(difficulty: string | undefined): boolean {
   return true;
 }
 
-function summarizeSteps(task: TaskItem): string {
-  if (!Array.isArray(task.steps) || task.steps.length === 0) return "无步骤";
-  return task.steps
-    .slice(0, 3)
-    .map((step) => {
-      if (typeof step === "string") return stripMarkdown(step);
-      return stripMarkdown(step.action || "");
-    })
-    .filter(Boolean)
-    .join("；");
-}
+type AiAdjustPlan = {
+  restIntensity?: RestIntensity;
+  minuteScale?: number;
+  focusSubject?: string;
+  suggestion?: string;
+  rewrites?: Array<{
+    match?: string;
+    title?: string;
+    description?: string;
+    priority?: TaskItem["priority"];
+    suggestedMinutes?: number;
+  }>;
+};
 
+/** 精简提示：只让 AI 返回调整参数，不吐全量任务（避免超时落到本地算法） */
 function buildPrompt(req: ReplanRequest): string {
   const unfinished = req.plan.tasks.filter((t) => !t.completed);
-  const today = localDateStr();
   const budget = resolveBudget(req);
-  const workdays = req.plan.workdays?.length
-    ? req.plan.workdays
-    : ["weekday", "weekend"];
-  const schedule = buildDefaultSchedule(today, req.plan.deadline, workdays);
-  const executable = listExecutableDays(today, req.plan.deadline, workdays);
   const instruction = String(req.difficulty ?? "").trim();
-  const concrete = hasConcreteInstruction(instruction);
+  const restIntensity = resolveRestIntensity(instruction);
+  const titles = unfinished
+    .slice(0, 16)
+    .map((t, i) => `${i + 1}.${stripMarkdown(t.title)}`)
+    .join("；");
 
-  return `你是计划重排助手。根据用户指令动态调整剩余任务、任务内容与休息日。只输出合法 JSON，禁止 Markdown。
+  return `你是学习计划调整助手。根据用户指令输出「调整方案」JSON（不要输出全部任务列表）。禁止 Markdown。
 
 【目标】${req.plan.goal}
-【截止日期】${req.plan.deadline}
-【用户调整指令】${concrete ? instruction : "无具体指令（只重排日期与节奏，保持任务内容与步骤深度）"}
-【本目标每日预算】${budget} 分钟
-【全局每日上限】${Number(req.globalDailyCap) || budget} 分钟
-【其他目标今日已占用】${Number(req.otherGoalsOccupiedMinutes) || 0} 分钟
-【本目标完成率】${Number.isFinite(Number(req.goalCompletionRate)) ? `${req.goalCompletionRate}%` : "暂无"}
-【基础】${req.plan.foundation || "未填写"}
-【薄弱】${req.plan.weakness || "未填写"}
-【可执行日偏好】${workdays.join("、")}，共 ${executable.length} 天
-【推荐工作日样例】${schedule.workDates.slice(0, 8).join("、")}
-【推荐休息日样例】${schedule.restDates.slice(0, 6).join("、") || "无"}
-
-【未完成任务（含内容与步骤摘要，改写时必须基于这些细节）】
-${unfinished
-  .map(
-    (t, index) =>
-      `${index + 1}. ${t.date} | ${t.subject ? `[${stripMarkdown(t.subject)}] ` : ""}${stripMarkdown(t.title)} | ${t.suggestedMinutes}分钟 | ${t.priority}
-  描述: ${stripMarkdown(t.description || "无")}
-  步骤: ${summarizeSteps(t)}
-  自检: ${stripMarkdown(t.checkCriteria || "无")}`,
-  )
-  .join("\n") || "（无）"}
+【截止】${req.plan.deadline}
+【每日预算】${budget} 分钟
+【用户指令】${instruction}
+【预判休息强度】${restIntensity}（recovery=多休，standard=标准，sprint=少休）
+【任务标题样例】${titles || "无"}
 
 规则：
-0. ${
-    concrete
-      ? "有具体指令：必须改写相关任务的 title/description/steps 内容与排期，禁止只挪日期；可增减任务、调整科目先后。指令与下列规则冲突时以指令为准。"
-      : "无具体指令：保持 title/description/steps 语义与深度，只调整 date/schedule/suggestedMinutes 节奏。"
-  }
-1. 只重排未完成任务；不要输出已完成任务。
-2. 任务只能落在工作日；每天总分钟 ≤ ${Math.round(budget * 0.9)}；有任务日尽量用到预算 60%-90%。
-3. 根据反馈动态调整：太累则增加休息日/降低每日量；状态好可略增强度。
-4. 高优先级靠前；日期覆盖到截止前冲刺周；相邻有任务工作日间隔尽量 ≤ 2 天。
-5. 输出 schedule.workDates 与 schedule.restDates。
-6. 每个任务必须输出与默认拆解同级的具体化结构：subject、checkCriteria、steps(2-3项，含 action/goal/minutes/guide/microActions/blockers)。
-7. title 是 8-25 字具体动作；description 30-60 字；纯文本，禁止 **。
+1. restIntensity 必须是 recovery | standard | sprint 之一，且符合用户指令。
+2. minuteScale：放慢约 0.7-0.85，加强约 1.1-1.2，默认 1。
+3. focusSubject：若指令提到优先科目则填写，否则空字符串。
+4. rewrites 最多 6 条：只改写与指令相关的任务；match 用原标题关键词。
+5. suggestion 一句中文，说明休息/强度/内容如何变，≤28 字。
 
 输出：
-{"schedule":{"workDates":["YYYY-MM-DD"],"restDates":["YYYY-MM-DD"]},"tasks":[{"date":"YYYY-MM-DD","subject":"科目或模块","title":"8-25字具体动作","description":"30-60字","suggestedMinutes":30,"priority":"medium","checkCriteria":"一句自检","steps":[{"action":"步骤标题","goal":"达成结果","minutes":20,"guide":"一句话","microActions":[{"text":"具体动作","material":"材料","sourceRef":"题号/段落","timeLimit":"15分钟"}],"checkCriteria":"本步自检","blockers":[{"problem":"卡点","solution":"解法"}]}],"topicTags":["标签"],"resourceSuggestions":["检索词"],"reviewIntervals":[3,7,14,30]}],"suggestion":"一句鼓励，30字内"}`;
+{"restIntensity":"recovery","minuteScale":0.8,"focusSubject":"","rewrites":[{"match":"关键词","title":"新标题","priority":"medium","suggestedMinutes":30}],"suggestion":"已增加休息并放慢节奏"}`;
+}
+
+function parseAiAdjustPlan(raw: unknown): AiAdjustPlan | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const intensityRaw = String(obj.restIntensity ?? "").trim();
+  const restIntensity: RestIntensity | undefined =
+    intensityRaw === "recovery" ||
+    intensityRaw === "standard" ||
+    intensityRaw === "sprint"
+      ? intensityRaw
+      : undefined;
+  const minuteScale = Number(obj.minuteScale);
+  const rewrites = Array.isArray(obj.rewrites)
+    ? obj.rewrites
+        .map((item) => {
+          if (!item || typeof item !== "object") return null;
+          const r = item as Record<string, unknown>;
+          const priority = String(r.priority ?? "");
+          return {
+            match: stripMarkdown(String(r.match ?? "")).slice(0, 40),
+            title: r.title ? stripMarkdown(String(r.title)).slice(0, 50) : undefined,
+            description: r.description
+              ? stripMarkdown(String(r.description)).slice(0, 80)
+              : undefined,
+            priority:
+              priority === "high" || priority === "medium" || priority === "low"
+                ? (priority as TaskItem["priority"])
+                : undefined,
+            suggestedMinutes: Number.isFinite(Number(r.suggestedMinutes))
+              ? Math.min(180, Math.max(15, Math.round(Number(r.suggestedMinutes))))
+              : undefined,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => Boolean(x?.match))
+        .slice(0, 6)
+    : [];
+
+  return {
+    ...(restIntensity ? { restIntensity } : {}),
+    ...(Number.isFinite(minuteScale) && minuteScale > 0.4 && minuteScale < 1.6
+      ? { minuteScale }
+      : {}),
+    focusSubject: stripMarkdown(String(obj.focusSubject ?? "")).slice(0, 20),
+    suggestion: stripMarkdown(String(obj.suggestion ?? "")).slice(0, 40),
+    rewrites,
+  };
+}
+
+/** 把 AI 精简方案套到原未完成任务上，再交给 finalize 排期 */
+function applyAiAdjustPlan(
+  unfinished: TaskItem[],
+  plan: AiAdjustPlan,
+  budget: number,
+  instruction: string,
+): Array<Omit<TaskItem, "id" | "completed" | "focusSeconds">> {
+  const scale =
+    Number.isFinite(Number(plan.minuteScale)) && Number(plan.minuteScale) > 0
+      ? Number(plan.minuteScale)
+      : /太累|放慢|休息|轻松/.test(instruction)
+        ? 0.8
+        : /加强|冲刺|加量/.test(instruction)
+          ? 1.15
+          : 1;
+  const focus = String(plan.focusSubject ?? "").trim();
+  const rewrites = plan.rewrites ?? [];
+
+  return unfinished.map((t) => {
+    let minutes = Math.min(
+      budget,
+      Math.max(20, Math.round(Number(t.suggestedMinutes) * scale)),
+    );
+    let priority = t.priority;
+    let title = t.title;
+    let description = t.description;
+    let subject = t.subject;
+
+    const hitRewrite = rewrites.find((r) => {
+      const key = normalizeTitle(r.match);
+      if (!key) return false;
+      return (
+        normalizeTitle(t.title).includes(key) ||
+        normalizeSubject(t.subject).includes(key) ||
+        key.includes(normalizeTitle(t.title).slice(0, 6))
+      );
+    });
+    if (hitRewrite) {
+      if (hitRewrite.title) title = hitRewrite.title;
+      if (hitRewrite.description) description = hitRewrite.description;
+      if (hitRewrite.priority) priority = hitRewrite.priority;
+      if (hitRewrite.suggestedMinutes) {
+        minutes = Math.min(budget, hitRewrite.suggestedMinutes);
+      }
+    }
+
+    if (focus) {
+      const hit =
+        normalizeSubject(subject).includes(normalizeSubject(focus)) ||
+        normalizeTitle(title).includes(normalizeSubject(focus));
+      if (hit) priority = "high";
+    }
+
+    return {
+      date: t.date || localDateStr(),
+      title,
+      description:
+        description ||
+        `围绕「${title}」完成一轮可检查练习。`,
+      suggestedMinutes: minutes,
+      priority,
+      checkCriteria:
+        t.checkCriteria || `完成「${title}」并留下可核对的产出`,
+      ...(subject ? { subject } : {}),
+      ...(t.steps ? { steps: t.steps } : {}),
+      ...(t.topicTags?.length ? { topicTags: t.topicTags } : {}),
+      ...(t.priorityReason ? { priorityReason: t.priorityReason } : {}),
+      ...(t.sourceReason ? { sourceReason: t.sourceReason } : {}),
+      ...(t.resourceSuggestions?.length
+        ? { resourceSuggestions: t.resourceSuggestions }
+        : {}),
+      ...(t.reviewIntervals?.length
+        ? { reviewIntervals: t.reviewIntervals }
+        : {}),
+    };
+  });
 }
 
 function normalizeTitle(value: unknown): string {
@@ -237,59 +340,57 @@ function inheritTaskDetails(
 function finalizeReplan(
   req: ReplanRequest,
   tasks: Array<Omit<TaskItem, "id" | "completed" | "focusSeconds">>,
-  aiSchedule?: PlanSchedule | null,
+  _aiSchedule?: PlanSchedule | null,
+  restIntensity?: RestIntensity,
 ): { tasks: typeof tasks; schedule: PlanSchedule } {
   const today = localDateStr();
   const workdays = req.plan.workdays?.length
     ? req.plan.workdays
     : ["weekday", "weekend"];
   const budget = resolveBudget(req);
-  const fallback = buildDefaultSchedule(today, req.plan.deadline, workdays);
-  const schedule: PlanSchedule = {
-    workDates: (aiSchedule?.workDates?.length
-      ? aiSchedule.workDates
-      : fallback.workDates
-    )
-      .slice()
-      .sort(),
-    restDates: (aiSchedule?.restDates ?? fallback.restDates).slice().sort(),
+  const intensity =
+    restIntensity ?? resolveRestIntensity(String(req.difficulty ?? ""));
+  // 日历由算法按休息强度生成，保证指令会真实改变休息日/节奏
+  void _aiSchedule;
+  let schedule: PlanSchedule = {
+    ...buildDefaultSchedule(today, req.plan.deadline, workdays, {
+      restIntensity: intensity,
+    }),
     dailyBudgetMinutes: budget,
   };
   const first =
     snapToNextExecutableDay(today, workdays, req.plan.deadline) ?? today;
   if (!schedule.workDates.includes(first)) {
     schedule.workDates = [first, ...schedule.workDates].sort();
+    schedule.restDates = schedule.restDates.filter((d) => d !== first);
   }
 
-  const withDates = tasks.map((task) => {
-    let date = task.date;
-    if (!schedule.workDates.includes(date)) {
-      date =
-        snapToNextExecutableDay(date, workdays, req.plan.deadline) ??
-        schedule.workDates[0] ??
-        today;
-    }
-    return {
-      ...task,
-      date,
-      title: stripMarkdown(task.title),
-      description: stripMarkdown(task.description),
-    };
-  });
+  const withDates = tasks.map((task) => ({
+    ...task,
+    date: first,
+    title: stripMarkdown(task.title),
+    description: stripMarkdown(task.description),
+  }));
 
   const detailed = inheritTaskDetails(
     withDates,
     req.plan.tasks.filter((t) => !t.completed),
   );
 
+  const distributed = distributeTasksToWorkDates(
+    detailed,
+    schedule.workDates,
+    Math.round(budget * 0.9),
+    req.plan.deadline,
+  );
+  schedule = tightenScheduleToTasks(
+    schedule,
+    distributed.map((t) => t.date),
+  );
+
   return {
     schedule,
-    tasks: distributeTasksToWorkDates(
-      detailed,
-      schedule.workDates,
-      Math.round(budget * 0.9),
-      req.plan.deadline,
-    ),
+    tasks: distributed,
   };
 }
 
@@ -439,33 +540,15 @@ function generateMockReplan(req: ReplanRequest): {
           : {}),
       }));
 
-  // 太累时：把部分工作日挪到休息，通过缩短预算日体现
-  let scheduleOverride: PlanSchedule | null = null;
-  if (concrete && /太累|休息|放慢/.test(instruction)) {
-    const today = localDateStr();
-    const workdays = req.plan.workdays?.length
-      ? req.plan.workdays
-      : ["weekday", "weekend"];
-    const base = buildDefaultSchedule(today, req.plan.deadline, workdays);
-    const workDates = base.workDates.filter((_, i) => i % 3 !== 2);
-    const restDates = [
-      ...base.restDates,
-      ...base.workDates.filter((_, i) => i % 3 === 2),
-    ].sort();
-    scheduleOverride = {
-      workDates: workDates.length ? workDates : base.workDates,
-      restDates,
-      dailyBudgetMinutes: budget,
-    };
-  }
-
-  const finalized = finalizeReplan(req, raw, scheduleOverride);
+  const intensity = resolveRestIntensity(instruction);
+  const finalized = finalizeReplan(req, raw, null, intensity);
+  const restCount = finalized.schedule.restDates?.length ?? 0;
   return {
     tasks: finalized.tasks,
     schedule: finalized.schedule,
     suggestion: concrete
-      ? `已按「${instruction.slice(0, 18)}」调整任务内容与排期`
-      : "已重新排期，任务执行细节保持不变",
+      ? `已按「${instruction.slice(0, 16)}」调整（休息日 ${restCount} 天）`
+      : `已重排节奏（休息日 ${restCount} 天）`,
   };
 }
 
@@ -510,7 +593,36 @@ export default async (req: Request): Promise<Response> => {
     );
   }
 
-  let completion;
+  const instruction = String(body.difficulty ?? "").trim();
+  const unfinished = body.plan.tasks.filter((t) => !t.completed);
+  const budget = resolveBudget(body);
+
+  // 无具体指令：本地按标准节奏重排即可（保留 steps），不算演示模式
+  if (!hasConcreteInstruction(instruction)) {
+    const local = generateMockReplan(body);
+    return Response.json({ ...local, mock: false });
+  }
+
+  // 本地函数硬限约 30s：精简方案约 1–3s；留足预算让 API key 稳定打到 DeepSeek
+  const AI_BUDGET_MS = 22_000;
+  const raceDeadline = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`AI deadline exceeded (${ms}ms)`)),
+            ms,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  let aiPlan: AiAdjustPlan | null = null;
   try {
     const ai = createAiClient();
     if (!ai) {
@@ -519,68 +631,66 @@ export default async (req: Request): Promise<Response> => {
       );
     }
     const { client, model } = ai;
-    completion = await client.chat.completions.create(
-      {
-        model,
-        messages: [
-          {
-            role: "system",
-            content:
-              "你是计划重排助手。必须输出合法 JSON，任务需包含与首次拆解同级的 steps/microActions/blockers。禁止 Markdown。",
-          },
-          { role: "user", content: buildPrompt(body) },
-        ],
-        temperature: 0.35,
-        max_tokens: 3200,
-        response_format: { type: "json_object" },
-      },
-      { timeout: 12_000 },
+    const completion = await raceDeadline(
+      client.chat.completions.create(
+        {
+          model,
+          messages: [
+            {
+              role: "system",
+              content:
+                "你是学习计划调整助手。只输出精简调整方案 JSON（restIntensity/minuteScale/rewrites/suggestion），禁止输出完整 tasks 数组。",
+            },
+            { role: "user", content: buildPrompt(body) },
+          ],
+          temperature: 0.25,
+          max_tokens: 700,
+          response_format: { type: "json_object" },
+        },
+        { timeout: AI_BUDGET_MS },
+      ),
+      AI_BUDGET_MS,
     );
+    const content = completion.choices?.[0]?.message?.content ?? "";
+    const cleaned = content
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/```$/i, "")
+      .trim();
+    aiPlan = parseAiAdjustPlan(JSON.parse(cleaned));
+    if (!aiPlan) {
+      throw new Error("AI adjust plan empty");
+    }
   } catch (err) {
     console.warn(
-      "AI 调用失败，使用指令感知 mock 兜底:",
+      "AI 调整方案失败，回退本地启发式:",
       err instanceof Error ? err.message : err,
     );
     const mock = generateMockReplan(body);
     return Response.json({ ...mock, mock: true });
   }
 
-  const content = completion.choices?.[0]?.message?.content ?? "";
-  let parsed: {
-    tasks?: unknown[];
-    suggestion?: string;
-    schedule?: PlanSchedule;
-  };
-  try {
-    const cleaned = content
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/```$/i, "")
-      .trim();
-    parsed = JSON.parse(cleaned);
-  } catch {
-    const mock = generateMockReplan(body);
-    return Response.json({ ...mock, mock: true });
-  }
-
-  const arr = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-  const tasks = arr
-    .map(sanitizeFullTask)
-    .filter((t): t is NonNullable<typeof t> => t !== null);
-
+  const intensity =
+    aiPlan.restIntensity ?? resolveRestIntensity(instruction);
+  const tasks = applyAiAdjustPlan(unfinished, aiPlan, budget, instruction);
   if (tasks.length === 0) {
     const mock = generateMockReplan(body);
     return Response.json({ ...mock, mock: true });
   }
 
-  const finalized = finalizeReplan(body, tasks, parsed.schedule ?? null);
+  const finalized = finalizeReplan(body, tasks, null, intensity);
+  const restCount = finalized.schedule.restDates?.length ?? 0;
   const result: ReplanResponse = {
     tasks: finalized.tasks,
     schedule: finalized.schedule,
     suggestion: stripMarkdown(
-      String(parsed.suggestion ?? "已为你重新安排，继续加油！"),
+      String(
+        aiPlan.suggestion ||
+          `已按 AI 调整：休息日 ${restCount} 天（${intensity}）`,
+      ),
     ).slice(0, 60),
   };
+  // 真实走了 API key，不标 mock
   return Response.json(result);
 };
 

@@ -11,8 +11,8 @@ import {
   distributeTasksToWorkDates,
   listExecutableDays,
   localDateStr,
-  parseLocalDate,
   snapToNextExecutableDay,
+  tightenScheduleToTasks,
 } from "../../src/lib/scheduleDates";
 import { compactPlainText } from "../../src/lib/textSanitize";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
@@ -34,12 +34,47 @@ function resolveDailyBudget(req: DecomposeRequest): number {
   return Math.max(15, Math.round(Number(req.dailyMinutes) || 120));
 }
 
+/** 按「工作日」估算任务数：休息日不稀释密度，工作日仍约 ≥1 个/日 */
+function resolveTaskCountBounds(req: DecomposeRequest): {
+  minTasks: number;
+  maxTasks: number;
+  executableCount: number;
+  workDayCount: number;
+} {
+  const todayStr = localDateStr();
+  const executableDays = listExecutableDays(todayStr, req.deadline, req.workdays);
+  const executableCount = Math.max(1, executableDays.length);
+  const schedule = buildDefaultSchedule(todayStr, req.deadline, req.workdays, {
+    restIntensity: "standard",
+  });
+  const workDayCount = Math.max(1, schedule.workDates.length);
+  // 至少约 1 任务/工作日才能铺满截止；上限 90 覆盖免费版最长周期
+  const TASK_CAP = 90;
+  const minTasks = Math.min(
+    TASK_CAP,
+    Math.max(
+      8,
+      workDayCount <= TASK_CAP
+        ? workDayCount
+        : Math.ceil(workDayCount * 0.9),
+    ),
+  );
+  const maxTasks = Math.min(
+    TASK_CAP,
+    Math.max(minTasks, Math.ceil(workDayCount * 1.1)),
+  );
+  return { minTasks, maxTasks, executableCount, workDayCount };
+}
+
 function buildPrompt(req: DecomposeRequest): string {
   const todayStr = localDateStr();
   const dailyBudget = resolveDailyBudget(req);
   const executableDays = listExecutableDays(todayStr, req.deadline, req.workdays);
-  const executableCount = Math.max(1, executableDays.length);
-  const schedule = buildDefaultSchedule(todayStr, req.deadline, req.workdays);
+  const { minTasks, maxTasks, executableCount, workDayCount } =
+    resolveTaskCountBounds(req);
+  const schedule = buildDefaultSchedule(todayStr, req.deadline, req.workdays, {
+    restIntensity: "standard",
+  });
   const lastTaskDateStr =
     schedule.workDates[schedule.workDates.length - 1] ??
     executableDays[executableDays.length - 1] ??
@@ -47,18 +82,18 @@ function buildPrompt(req: DecomposeRequest): string {
 
   let strategy: string;
   let taskCountHint: string;
-  if (executableCount <= 7) {
-    strategy = "短期冲刺：几乎每个可执行日都有任务，每天 1-2 个";
-    taskCountHint = `${Math.min(executableCount * 2, 14)} 个任务左右`;
-  } else if (executableCount <= 30) {
-    strategy = "月度计划：约每天 1 个可执行任务，前中后三段都要有实质练习";
-    taskCountHint = `${Math.min(Math.max(12, Math.ceil(executableCount * 1.05)), 28)} 个任务`;
-  } else if (executableCount <= 90) {
-    strategy = "季度计划：按周推进，每周至少 3-4 个具体练习任务，覆盖诊断/专项/模拟";
-    taskCountHint = `${Math.min(Math.max(18, Math.ceil(executableCount * 0.55)), 36)} 个任务`;
+  if (workDayCount <= 7) {
+    strategy = "短期冲刺：几乎每个工作日 1-2 个任务，禁止隔天空白";
+    taskCountHint = `${Math.min(workDayCount * 2, 14)}-${Math.min(workDayCount * 2 + 2, 16)} 个任务（不得少于 ${Math.min(workDayCount, 8)} 个）`;
+  } else if (workDayCount <= 40) {
+    strategy = "限期密集：每个工作日都有任务；休息日按推荐休息日插入，不降低工作日密度";
+    taskCountHint = `${minTasks}-${Math.min(maxTasks, 40)} 个任务（硬性不少于 ${minTasks} 个，铺满工作日到截止附近）`;
+  } else if (workDayCount <= 90) {
+    strategy = "季度密集：工作日连续密铺，按推荐节奏插入休息日，禁止大段空周";
+    taskCountHint = `${minTasks}-${Math.min(maxTasks, 40)} 个任务（硬性不少于 ${minTasks} 个）`;
   } else {
-    strategy = "长期计划：按阶段里程碑密集排布，开始、中段、冲刺周都要有实质任务";
-    taskCountHint = `${Math.min(Math.max(24, Math.ceil(executableCount * 0.35)), 42)} 个任务`;
+    strategy = "长期仍要密：工作日密铺 + 周期性休息；开始两周与冲刺两周必须最密";
+    taskCountHint = `${minTasks}-${Math.min(maxTasks, 40)} 个任务（硬性不少于 ${minTasks} 个）`;
   }
 
   const unfinishedTasks = (req.unfinishedTasks ?? [])
@@ -88,9 +123,9 @@ function buildPrompt(req: DecomposeRequest): string {
 - 起始日期：${todayStr}
 - 截止日期：${req.deadline}，最后任务不晚于 ${lastTaskDateStr}
 - 本目标每日预算：${dailyBudget} 分钟（全局上限 ${Number(req.globalDailyCap) || dailyBudget}）
-- 可执行日偏好：${req.workdays.join("、")}；可执行日共 ${executableCount} 天
+- 可执行日偏好：${req.workdays.join("、")}；可执行日共 ${executableCount} 天，其中工作日约 ${workDayCount} 天
 - 推荐工作日样例：${sampleWork}
-- 推荐休息日样例：${sampleRest}
+- 推荐休息日样例：${sampleRest}（分布式练习：约每 5 个学习日 1 个休息日，优先周末；任务只落在工作日）
 - 当前基础：${req.foundation || "未填写"}
 - 薄弱领域：${req.weakness || "未填写"}
 - 密度：${strategy}；任务数建议：${taskCountHint}
@@ -101,16 +136,25 @@ function buildPrompt(req: DecomposeRequest): string {
 - 知识库薄弱点：${weakKnowledgePoints.length ? weakKnowledgePoints.join("；") : "暂无"}
 - 节奏提示：${req.adaptiveHint || "正常"}
 
+【排期密度铁律——违反即不合格】
+A. 任务总数必须达到「任务数建议」下限，禁止只输出 5-8 个骨架任务糊弄长周期。
+B. 任务只落在工作日，从起始工作日连续密铺；休息日按「推荐休息日」输出，休息日零任务。禁止两端锚点大跳跃。
+C. 相邻有任务的工作日间隔 ≤ 1 天（短期）或 ≤ 2 天（中长期）；不允许出现 ≥10 天的无任务跳跃。
+D. 有任务的日子：当日任务总分钟尽量达到预算的 65%-90%；单任务时长优先 25-45 分钟。
+E. 休息日是恢复日不是空档：插入休息后，工作日上的任务密度不能变稀。
+F. 数学/英语等学科目标：按「知识点/题型 → 限时练习 → 错题订正」循环密集排布。
+
 硬性规则：
-1. date 必须在推荐工作日上；day1 必须是 ${todayStr}（若今天不可执行则用最近工作日）。
-2. 每天总分钟数 ≤ ${Math.round(dailyBudget * 0.9)}，同一天最多 3 个任务；有任务的日子尽量用到预算的 60%-90%，禁止大量空档日。
-3. 任务日期必须覆盖前期、中期、冲刺：最早任务在开始 3 天内，最晚任务在截止前 7 天内；相邻有任务的工作日间隔尽量不超过 2 天。
-4. 备考目标必须拆到考试模块/题型/练习动作；禁止“澄清目标/成功标准/搭建框架”。
+1. date 必须在推荐工作日上；第 1 个任务日期必须是 ${todayStr}（若今天不可执行则用最近工作日）。
+2. 每天总分钟数 ≤ ${Math.round(dailyBudget * 0.9)}，同一天最多 3 个任务。
+3. 最早任务在开始 3 天内；任务从起始日连续铺开。禁止为「覆盖截止」而把个别任务跳贴到截止前 7 天（那会造成中间空洞）。任务够多时自然延伸到冲刺周即可。
+4. 备考目标必须拆到考试模块/题型/练习动作；禁止“澄清目标/成功标准/搭建框架/制定计划表”这类空任务。
 5. 工作/项目目标才允许需求澄清、交付、评审类任务。
 6. 薄弱领域相关任务占比不少于 30%。
-7. steps 2-3 项，含 action、goal、minutes、microActions、checkCriteria、blockers；guide 一句话。
-8. 文本全部用纯中文/英文，禁止 Markdown 符号。
-9. 同时输出 schedule.workDates 与 schedule.restDates（YYYY-MM-DD 数组）。
+7. 每个任务 steps 必须 2-3 项，含 action、goal、minutes、microActions、checkCriteria、blockers；guide 一句话。
+8. 文本全部用纯中文/英文，禁止 Markdown 符号（禁止 **）。
+9. schedule.workDates 必须是稠密连续可执行日（相邻间隔≤3天），禁止稀松抽样；restDates 只标少量休息日。
+10. suggestedMinutes 取 25-45 为主；不要大量 90+ 分钟巨型任务导致天数变少、空隙变大。
 
 返回结构：
 {"schedule":{"workDates":["YYYY-MM-DD"],"restDates":["YYYY-MM-DD"]},"tasks":[{"date":"YYYY-MM-DD","subject":"科目或模块","title":"8-25字具体动作","description":"30-60字","steps":[{"action":"步骤标题","goal":"达成结果","minutes":20,"guide":"一句话","microActions":[{"text":"具体动作","material":"材料","sourceRef":"题号/段落","timeLimit":"15分钟"}],"checkCriteria":"本步自检","blockers":[{"problem":"卡点","solution":"解法"}]}],"checkCriteria":"任务自检","suggestedMinutes":30,"priority":"high|medium|low","topicTags":["标签"],"priorityReason":"原因","sourceReason":"来源","resourceSuggestions":["检索词"],"reviewIntervals":[3,7,14,30]}]}`;
@@ -626,9 +670,10 @@ function generateMockTasks(req: DecomposeRequest): Omit<
   const workDays = days.length > 0 ? days : [today];
 
   const templates = pickMockTemplates(req);
+  const { minTasks } = resolveTaskCountBounds(req);
   const count = Math.max(
-    6,
-    Math.min(28, Math.ceil(workDays.length * 0.95)),
+    minTasks,
+    Math.min(90, workDays.length <= 90 ? workDays.length : Math.ceil(workDays.length * 0.9)),
   );
 
   const perDayMinutes = resolveDailyBudget(req);
@@ -759,6 +804,35 @@ function cleanFinalSteps(
   return steps.length ? steps : undefined;
 }
 
+/** DeepSeek 常被截断只吐 5 个：用场景模板补到下限，才能连续铺到截止日期 */
+function ensureEnoughTasks(
+  req: DecomposeRequest,
+  tasks: Array<Omit<TaskItem, "id" | "completed" | "focusSeconds">>,
+): Array<Omit<TaskItem, "id" | "completed" | "focusSeconds">> {
+  const { minTasks } = resolveTaskCountBounds(req);
+  if (tasks.length >= minTasks) return tasks;
+
+  const need = minTasks - tasks.length;
+  const usedTitles = new Set(tasks.map((t) => t.title));
+  const mocks = generateMockTasks(req);
+  const extras: Array<Omit<TaskItem, "id" | "completed" | "focusSeconds">> = [];
+
+  for (let i = 0; i < mocks.length * 3 && extras.length < need; i += 1) {
+    const base = mocks[i % mocks.length];
+    let title = base.title;
+    if (usedTitles.has(title)) {
+      title = `${base.title}（补练${extras.length + 1}）`;
+    }
+    usedTitles.add(title);
+    extras.push({ ...base, title });
+  }
+
+  console.warn(
+    `AI 仅返回 ${tasks.length} 个任务，已补足至 ${tasks.length + extras.length}（下限 ${minTasks}）`,
+  );
+  return [...tasks, ...extras];
+}
+
 function finalizeScheduledTasks(
   req: DecomposeRequest,
   tasks: Array<Omit<TaskItem, "id" | "completed" | "focusSeconds">>,
@@ -770,16 +844,15 @@ function finalizeScheduledTasks(
 } {
   const today = localDateStr();
   const dailyBudget = resolveDailyBudget(req);
-  const fallback = buildDefaultSchedule(today, req.deadline, req.workdays);
-  let schedule: PlanSchedule = aiSchedule?.workDates?.length
-    ? {
-        workDates: [...aiSchedule.workDates].sort(),
-        restDates: [...(aiSchedule.restDates ?? [])].sort(),
-        dailyBudgetMinutes: dailyBudget,
-      }
-    : { ...fallback, dailyBudgetMinutes: dailyBudget };
+  // 排期日历只信算法（含学术节奏休息日），不信模型稀松日期
+  void aiSchedule;
+  let schedule: PlanSchedule = {
+    ...buildDefaultSchedule(today, req.deadline, req.workdays, {
+      restIntensity: "standard",
+    }),
+    dailyBudgetMinutes: dailyBudget,
+  };
 
-  // 保证今天（或最近可执行日）在工作日中
   const firstWork =
     snapToNextExecutableDay(today, req.workdays, req.deadline) ?? today;
   if (!schedule.workDates.includes(firstWork)) {
@@ -787,23 +860,11 @@ function finalizeScheduledTasks(
     schedule.restDates = schedule.restDates.filter((d) => d !== firstWork);
   }
 
-  const workSet = new Set(schedule.workDates);
-  const snapped = tasks.map((task) => {
-    let date = task.date;
-    if (!workSet.has(date)) {
-      date =
-        snapToNextExecutableDay(date, req.workdays, req.deadline) ??
-        schedule.workDates[0] ??
-        today;
-      if (!workSet.has(date) && schedule.workDates.length) {
-        date = schedule.workDates[0];
-      }
-    }
-    if (parseLocalDate(date) > parseLocalDate(req.deadline)) {
-      date = schedule.workDates[schedule.workDates.length - 1] ?? today;
-    }
-    return { ...task, date };
-  });
+  // 忽略模型自带 date，从首个工作日起连续重排
+  const snapped = tasks.map((task) => ({
+    ...task,
+    date: firstWork,
+  }));
 
   const distributed = distributeTasksToWorkDates(
     snapped,
@@ -845,6 +906,8 @@ function finalizeScheduledTasks(
         : [],
     };
   });
+
+  schedule = tightenScheduleToTasks(schedule, capped.map((t) => t.date));
 
   return {
     tasks: capped,
@@ -959,6 +1022,29 @@ export default async (req: Request): Promise<Response> => {
     body.workdays = ["weekday", "weekend"];
   }
 
+  // 本地 vite 同步函数硬限 30s：全部 AI 尝试合计不得超过该预算，否则进不了 mock
+  const AI_BUDGET_MS = 18_000;
+  const aiStartedAt = Date.now();
+  const remainingAiMs = () =>
+    Math.max(2_000, AI_BUDGET_MS - (Date.now() - aiStartedAt));
+
+  const raceDeadline = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`AI deadline exceeded (${ms}ms)`)),
+            ms,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   let content = "";
   try {
     const ai = createAiClient();
@@ -970,7 +1056,7 @@ export default async (req: Request): Promise<Response> => {
       {
         role: "system" as const,
         content:
-          "你是任务拆解助手。必须输出合法 JSON 对象。考试目标直接拆到科目/题型/练习动作，禁止输出泛泛的目标管理任务。",
+          "你是任务拆解助手。必须输出合法 JSON 对象。考试目标直接拆到科目/题型/练习动作，禁止输出泛泛的目标管理任务。优先保证任务数量足够铺满截止日期，steps 保持简洁。",
       },
       { role: "user" as const, content: buildPrompt(body) },
     ];
@@ -978,32 +1064,41 @@ export default async (req: Request): Promise<Response> => {
       model,
       messages,
       temperature: 0.2,
-      max_tokens: 2200,
+      // 不够的任务由 ensureEnoughTasks 补满
+      max_tokens: 4096,
     };
 
     try {
-      const completion = await client.chat.completions.create(
-        {
-          ...baseRequest,
-          response_format: { type: "json_object" },
-        },
-        { timeout: 12_000 },
+      const slice = remainingAiMs();
+      const completion = await raceDeadline(
+        client.chat.completions.create(
+          {
+            ...baseRequest,
+            response_format: { type: "json_object" },
+          },
+          { timeout: slice },
+        ),
+        slice,
       );
       content = completion.choices?.[0]?.message?.content ?? "";
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const canRetryWithoutJsonMode =
         /response_format|json_object|unsupported|invalid.*parameter|400/i.test(message) &&
-        !/timeout|timed out|abort/i.test(message);
+        !/timeout|timed out|abort|deadline/i.test(message);
 
       if (!canRetryWithoutJsonMode) {
         throw err;
       }
 
       console.warn("AI JSON 模式不可用，降级为普通 JSON 提示:", message);
-      const completion = await client.chat.completions.create(baseRequest, {
-        timeout: 10_000,
-      });
+      const slice = remainingAiMs();
+      const completion = await raceDeadline(
+        client.chat.completions.create(baseRequest, {
+          timeout: slice,
+        }),
+        slice,
+      );
       content = completion.choices?.[0]?.message?.content ?? "";
     }
   } catch (err) {
@@ -1050,6 +1145,9 @@ export default async (req: Request): Promise<Response> => {
     tasks = [...tasks, ...supplements];
   }
 
+  // 无论 JSON 是否完整：任务数不够就补满，避免只铺到开头几天（如截止 8/21 却只到 7/20）
+  tasks = ensureEnoughTasks(body, tasks);
+
   if (tasksNeedScenarioFallback(body, tasks)) {
     console.warn("AI 返回任务过于通用，使用场景化兜底");
     const mockTasks = generateMockTasks(body);
@@ -1073,8 +1171,30 @@ export default async (req: Request): Promise<Response> => {
     });
   }
 
-  const finalized = finalizeScheduledTasks(body, tasks, aiSchedule);
-  if (finalized.tasks.length === 0) {
+  try {
+    const finalized = finalizeScheduledTasks(body, tasks, aiSchedule);
+    if (finalized.tasks.length === 0) {
+      const mockTasks = generateMockTasks(body);
+      const fallback = finalizeScheduledTasks(body, mockTasks, null);
+      return Response.json({
+        tasks: fallback.tasks,
+        schedule: fallback.schedule,
+        allocatedDailyMinutes: fallback.allocatedDailyMinutes,
+        mock: true,
+      });
+    }
+
+    const result: DecomposeResponse = {
+      tasks: finalized.tasks,
+      schedule: finalized.schedule,
+      allocatedDailyMinutes: finalized.allocatedDailyMinutes,
+    };
+    return Response.json(result);
+  } catch (err) {
+    console.warn(
+      "排期收尾失败，使用场景化兜底:",
+      err instanceof Error ? err.message : err,
+    );
     const mockTasks = generateMockTasks(body);
     const fallback = finalizeScheduledTasks(body, mockTasks, null);
     return Response.json({
@@ -1084,13 +1204,6 @@ export default async (req: Request): Promise<Response> => {
       mock: true,
     });
   }
-
-  const result: DecomposeResponse = {
-    tasks: finalized.tasks,
-    schedule: finalized.schedule,
-    allocatedDailyMinutes: finalized.allocatedDailyMinutes,
-  };
-  return Response.json(result);
 };
 
 export const config: Config = {

@@ -4,8 +4,10 @@ import {
   buildDefaultSchedule,
   distributeTasksToWorkDates,
   isExecutableDay,
+  isSparseDateList,
   listExecutableDays,
   localDateStr,
+  resolveRestIntensity,
   snapToNextExecutableDay,
 } from "./scheduleDates";
 
@@ -36,6 +38,24 @@ describe("scheduleDates", () => {
     expect(schedule.workDates.length).toBeGreaterThan(10);
     expect(schedule.workDates[0]).toBe("2026-07-18");
     expect(schedule.workDates.at(-1)).toBeTruthy();
+    expect(schedule.restDates.length).toBeGreaterThan(0);
+  });
+
+  it("recovery 比 standard 休息日更多，sprint 更少", () => {
+    const workdays = ["weekday", "weekend"] as const;
+    const standard = buildDefaultSchedule("2026-07-18", "2026-08-21", [...workdays], {
+      restIntensity: "standard",
+    });
+    const recovery = buildDefaultSchedule("2026-07-18", "2026-08-21", [...workdays], {
+      restIntensity: "recovery",
+    });
+    const sprint = buildDefaultSchedule("2026-07-18", "2026-08-21", [...workdays], {
+      restIntensity: "sprint",
+    });
+    expect(recovery.restDates.length).toBeGreaterThanOrEqual(standard.restDates.length);
+    expect(sprint.restDates.length).toBeLessThanOrEqual(standard.restDates.length);
+    expect(resolveRestIntensity("节奏放慢并增加休息")).toBe("recovery");
+    expect(resolveRestIntensity("冲刺加练少休息")).toBe("sprint");
   });
 
   it("任务超预算时顺延到下一工作日而不是丢弃", () => {
@@ -78,10 +98,47 @@ describe("scheduleDates", () => {
       90,
       "2026-09-01",
     );
-    const usedDates = new Set(placed.map((t) => t.date));
-    // 6 个任务应落在约 6 个锚点日，而不是稀疏散在 20 天
-    expect(usedDates.size).toBeLessThanOrEqual(8);
-    expect(usedDates.size).toBeGreaterThanOrEqual(4);
+    const usedDates = [...new Set(placed.map((t) => t.date))].sort();
+    // 6 个任务应落在约 6 个连续日，而不是稀疏散在 20 天
+    expect(usedDates.length).toBeLessThanOrEqual(8);
+    expect(usedDates.length).toBeGreaterThanOrEqual(4);
+    // 禁止两端锚点：有任务日在工作日序列上必须连续（相邻下标差 ≤1）
+    const indices = usedDates.map((d) => workDates.indexOf(d)).sort((a, b) => a - b);
+    for (let i = 1; i < indices.length; i += 1) {
+      expect(indices[i] - indices[i - 1]).toBeLessThanOrEqual(1);
+    }
+    expect(isSparseDateList(["2026-08-01", "2026-08-21"], 4)).toBe(true);
+  });
+
+  it("任务数接近工作日数时一天一个，能铺到截止附近", () => {
+    const workDates = Array.from({ length: 30 }, (_, i) => {
+      const d = new Date(2026, 6, 18);
+      d.setDate(d.getDate() + i);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    });
+    const tasks = Array.from({ length: 30 }, (_, i) => ({
+      date: workDates[0],
+      suggestedMinutes: 50,
+      title: `t${i}`,
+    }));
+    const placed = distributeTasksToWorkDates(
+      tasks,
+      workDates,
+      100,
+      "2026-08-20",
+    );
+    const last = [...placed.map((t) => t.date)].sort().at(-1);
+    expect(last).toBe(workDates[workDates.length - 1]);
+    // 绝大多数天只有 1 个任务
+    const perDay = placed.reduce<Record<string, number>>((acc, t) => {
+      acc[t.date] = (acc[t.date] ?? 0) + 1;
+      return acc;
+    }, {});
+    const multi = Object.values(perDay).filter((n) => n > 1).length;
+    expect(multi).toBeLessThanOrEqual(2);
   });
 
   it("多目标全局预算按紧迫度分配且不超过上限", () => {

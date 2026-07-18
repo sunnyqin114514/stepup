@@ -81,14 +81,14 @@ export async function syncDevProEntitlement(pro: boolean): Promise<{
 export async function decomposePlan(
   req: DecomposeRequest
 ): Promise<DecomposeResponse> {
-  // 冷启动 + 真 AI 偶发超过 20s；演示场景放宽，避免前端先断开
-  return postJSON<DecomposeResponse>("/api/decompose", req, { timeoutMs: 40_000 });
+  // 对齐生产函数 timeout=60s，略留余量；后端 AI 总预算约 18s，失败走 mock
+  return postJSON<DecomposeResponse>("/api/decompose", req, { timeoutMs: 55_000 });
 }
 
 export async function replanPlan(
   req: ReplanRequest
 ): Promise<ReplanResponse> {
-  return postJSON<ReplanResponse>("/api/replan", req, { timeoutMs: 40_000 });
+  return postJSON<ReplanResponse>("/api/replan", req, { timeoutMs: 55_000 });
 }
 
 export async function askTaskHelp(

@@ -2,6 +2,16 @@
   command = "npm run build"
   publish = "dist"
 
+# 生产环境同步函数最长 60s（本地 vite 仍受 30s 硬限，见 decompose 内 AI 预算）
+[functions]
+  node_bundler = "esbuild"
+
+[functions."decompose"]
+  timeout = 60
+
+[functions."replan"]
+  timeout = 60
+
 [[redirects]]
   from = "/*"
   to = "/index.html"

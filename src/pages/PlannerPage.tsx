@@ -27,13 +27,16 @@ import {
   uid,
   upsertPlan,
 } from "../lib/storage";
-import { isWeekend } from "../lib/scheduleDates";
+import { isWeekend, localDateStr } from "../lib/scheduleDates";
 import type { Plan, ReviewCycle, TaskItem, Workspace } from "../types/plan";
 import {
   FREE_ACTIVE_GOAL_LIMIT,
   REVIEW_CYCLE_LABELS,
 } from "../types/plan";
 import TaskCard from "../components/TaskCard";
+import PlanCalendarBrief, {
+  monthCursorFromDate,
+} from "../components/PlanCalendarBrief";
 
 function groupByDate(tasks: TaskItem[]): Record<string, TaskItem[]> {
   const map: Record<string, TaskItem[]> = {};
@@ -69,9 +72,26 @@ export default function PlannerPage() {
   const [adjusting, setAdjusting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mockNotice, setMockNotice] = useState(false);
+  const [adjustNotice, setAdjustNotice] = useState<string | null>(null);
   const [adjustNote, setAdjustNote] = useState("");
   const [creatingNew, setCreatingNew] = useState(false);
   const [globalDailyCap, setGlobalDailyCapState] = useState(() => getGlobalDailyCap());
+  /** null = 查看全部时间线；有值则只展示该日任务 */
+  const [selectedCalDate, setSelectedCalDate] = useState<string | null>(null);
+  const [calMonth, setCalMonth] = useState(() =>
+    monthCursorFromDate(localDateStr()),
+  );
+
+  const resetCalendarFocus = (nextPlan: Plan | null) => {
+    const today = localDateStr();
+    setCalMonth(monthCursorFromDate(today));
+    if (!nextPlan) {
+      setSelectedCalDate(null);
+      return;
+    }
+    const hasToday = nextPlan.tasks.some((t) => t.date === today);
+    setSelectedCalDate(hasToday ? today : null);
+  };
 
   // AI 拆解时的动态文案轮播：让用户感知"系统在动"，缓解等待焦虑
   const LOADING_STEPS = [
@@ -95,6 +115,16 @@ export default function PlannerPage() {
 
   const plan = creatingNew ? null : activePlan;
 
+  // 切换目标时重置日历焦点（不在选日时触发）
+  useEffect(() => {
+    if (creatingNew) {
+      resetCalendarFocus(null);
+      return;
+    }
+    resetCalendarFocus(activePlan);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅随目标切换重置
+  }, [ws.activePlanId, creatingNew]);
+
   const grouped = useMemo(
     () => (plan ? groupByDate(plan.tasks) : {}),
     [plan]
@@ -116,13 +146,26 @@ export default function PlannerPage() {
 
     if (scheduleDates.length === 0) return [];
 
-    return scheduleDates.map((date) => ({
-      date,
-      type: (restSet.has(date) && !taskDates.has(date) ? "rest" : "task") as
-        | "task"
-        | "rest",
-      weekend: isWeekend(date),
-    })).filter((entry) => entry.type === "rest" || taskDates.has(entry.date));
+    const taskList = [...taskDates].sort();
+    const firstTask = taskList[0];
+    const lastTask = taskList[taskList.length - 1];
+
+    return scheduleDates
+      .map((date) => ({
+        date,
+        type: (restSet.has(date) && !taskDates.has(date) ? "rest" : "task") as
+          | "task"
+          | "rest",
+        weekend: isWeekend(date),
+      }))
+      .filter((entry) => {
+        if (taskDates.has(entry.date)) return true;
+        // 休息日只显示在首末任务之间，避免 8/1 休息后直接跳到 8/21 任务
+        if (entry.type === "rest" && firstTask && lastTask) {
+          return entry.date >= firstTask && entry.date <= lastTask;
+        }
+        return false;
+      });
   }, [plan, sortedDates]);
   const activeCount = getActivePlans(ws).length;
   const pro = isProUnlocked();
@@ -131,7 +174,7 @@ export default function PlannerPage() {
     setCreatingNew(false);
     const next = setActivePlanId(planId);
     setWs(next);
-    const p = next.plans.find((x) => x.id === planId);
+    const p = next.plans.find((x) => x.id === planId) ?? null;
     if (p) {
       setGoal(p.goal);
       setDeadline(p.deadline);
@@ -141,6 +184,7 @@ export default function PlannerPage() {
       setFoundation(p.foundation ?? "");
       setWeakness(p.weakness ?? "");
     }
+    resetCalendarFocus(p);
   };
 
   const startNewGoal = () => {
@@ -160,6 +204,7 @@ export default function PlannerPage() {
     setWeakness("");
     setError(null);
     setMockNotice(false);
+    resetCalendarFocus(null);
   };
 
   const toggleWorkday = (w: string) => {
@@ -287,6 +332,7 @@ export default function PlannerPage() {
       setCreatingNew(false);
       incrementDecomposeCount();
       setMockNotice(Boolean(res.mock));
+      resetCalendarFocus(newPlan);
       const todayCount = tasks.filter((t) => t.date === todayStr()).length;
       // 拆解成功 → 跳转学习日（高动机时刻落地）
       navigate("/schedule", {
@@ -315,6 +361,8 @@ export default function PlannerPage() {
       return;
     }
     setAdjusting(true);
+    setError(null);
+    setAdjustNotice(null);
     try {
       const cap = getGlobalDailyCap();
       const budgets = allocateDailyBudgetsForActiveGoals(
@@ -369,7 +417,17 @@ export default function PlannerPage() {
       };
       setWs(upsertPlan(nextPlan));
       incrementReplanCount();
-      setMockNotice(Boolean(res.mock));
+      // 调整日程不再复用「演示模式」黄条；算法兜底也会真实改休息日
+      setMockNotice(false);
+      const restN = res.schedule?.restDates?.length ?? 0;
+      const tip =
+        res.suggestion?.trim() ||
+        `已更新排期（休息日 ${restN} 天）`;
+      setAdjustNotice(
+        res.mock
+          ? `${tip}（AI 超时，已用本地算法按指令完成，休息日与节奏已生效）`
+          : tip,
+      );
       setAdjustNote("");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "调整失败";
@@ -703,6 +761,11 @@ export default function PlannerPage() {
             演示模式：当前为示例/兜底数据。配置 DeepSeek key 后将使用真实 AI。
           </div>
         )}
+        {adjustNotice && (
+          <div className="mt-4 rounded-lg bg-emerald-50 text-emerald-800 text-sm px-3 py-2">
+            {adjustNotice}
+          </div>
+        )}
 
         <div className="mt-5 flex flex-wrap items-center gap-3">
           <button
@@ -773,12 +836,27 @@ export default function PlannerPage() {
             </button>
           </div>
 
+          <PlanCalendarBrief
+            tasks={plan.tasks}
+            restDates={plan.schedule?.restDates ?? []}
+            selectedDate={selectedCalDate}
+            monthCursor={calMonth}
+            onSelectDate={(date) => {
+              setSelectedCalDate(date);
+              setCalMonth(monthCursorFromDate(date));
+            }}
+            onMonthChange={setCalMonth}
+            onShowAll={() => setSelectedCalDate(null)}
+          />
+
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-lg font-semibold text-slate-900">
               {plan.goal}
             </h2>
             <span className="text-xs text-slate-400">
-              {plan.tasks.length} 个任务 · 可编辑
+              {selectedCalDate
+                ? `${selectedCalDate} · ${(grouped[selectedCalDate] ?? []).length} 个任务`
+                : `${plan.tasks.length} 个任务 · 全部`}
             </span>
           </div>
 
@@ -789,15 +867,15 @@ export default function PlannerPage() {
           )}
 
           <div className="space-y-6">
-            {timelineEntries.map((entry) =>
-              entry.type === "task" ? (
-                <div key={entry.date}>
+            {selectedCalDate ? (
+              (grouped[selectedCalDate] ?? []).length > 0 ? (
+                <div>
                   <div className="text-xs font-medium text-slate-500 mb-2 px-1">
-                    {entry.date}
-                    {entry.weekend && " · 周末"}
+                    {selectedCalDate}
+                    {isWeekend(selectedCalDate) && " · 周末"}
                   </div>
                   <div className="space-y-2">
-                    {grouped[entry.date].map((t) => (
+                    {(grouped[selectedCalDate] ?? []).map((t) => (
                       <TaskCard
                         key={t.id}
                         task={t}
@@ -809,18 +887,53 @@ export default function PlannerPage() {
                   </div>
                 </div>
               ) : (
-                <div
-                  key={entry.date}
-                  className="rounded-xl border border-dashed border-slate-200 bg-slate-50/50 px-4 py-3 text-sm text-slate-400 flex items-center gap-2"
-                >
-                  <span className="text-base">
-                    {entry.weekend ? "☕" : "📅"}
-                  </span>
-                  <span>
-                    {entry.date} ·{" "}
-                    {entry.weekend ? "周末休息日" : "AI 安排休息日"}
-                  </span>
+                <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/50 px-4 py-6 text-sm text-slate-500 text-center">
+                  {plan.schedule?.restDates?.includes(selectedCalDate)
+                    ? `${selectedCalDate} · 休息日，暂无任务`
+                    : `${selectedCalDate} · 这天没有安排任务`}
+                  <button
+                    type="button"
+                    className="block mx-auto mt-2 text-xs text-[#c0451f] hover:underline"
+                    onClick={() => setSelectedCalDate(null)}
+                  >
+                    查看全部任务
+                  </button>
                 </div>
+              )
+            ) : (
+              timelineEntries.map((entry) =>
+                entry.type === "task" ? (
+                  <div key={entry.date}>
+                    <div className="text-xs font-medium text-slate-500 mb-2 px-1">
+                      {entry.date}
+                      {entry.weekend && " · 周末"}
+                    </div>
+                    <div className="space-y-2">
+                      {grouped[entry.date].map((t) => (
+                        <TaskCard
+                          key={t.id}
+                          task={t}
+                          goalLabel={plan.goal}
+                          onToggleComplete={handleToggle}
+                          onEdit={handleEdit}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    key={entry.date}
+                    className="rounded-xl border border-dashed border-slate-200 bg-slate-50/50 px-4 py-3 text-sm text-slate-400 flex items-center gap-2"
+                  >
+                    <span className="text-base">
+                      {entry.weekend ? "☕" : "📅"}
+                    </span>
+                    <span>
+                      {entry.date} ·{" "}
+                      {entry.weekend ? "周末休息日" : "AI 安排休息日"}
+                    </span>
+                  </div>
+                ),
               )
             )}
           </div>
