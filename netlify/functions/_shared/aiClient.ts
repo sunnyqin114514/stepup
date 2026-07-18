@@ -39,6 +39,8 @@ export function createAiClient(): AiClient | null {
       client: new OpenAI({
         apiKey: deepseekKey,
         baseURL: DEEPSEEK_BASE_URL,
+        // SDK 默认超时后重试 2 次，会把 7.5s 超时放大成 20s+，前端因此中断
+        maxRetries: 0,
       }),
       model: DEEPSEEK_MODEL,
     };
@@ -56,6 +58,7 @@ export function createAiClient(): AiClient | null {
     client: new OpenAI({
       apiKey: openAiKey,
       ...(openAiBaseUrl ? { baseURL: openAiBaseUrl } : {}),
+      maxRetries: 0,
     }),
     model: NETLIFY_MODEL,
   };
