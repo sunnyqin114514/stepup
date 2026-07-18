@@ -206,7 +206,11 @@ export default async (req: Request): Promise<Response> => {
 
   let completion;
   try {
-    const { client, model } = createAiClient();
+    const ai = createAiClient();
+    if (!ai) {
+      throw new Error("AI client unavailable: missing DeepSeek key and Netlify AI Gateway key");
+    }
+    const { client, model } = ai;
     completion = await client.chat.completions.create({
       model,
       messages: [
@@ -216,7 +220,7 @@ export default async (req: Request): Promise<Response> => {
       temperature: 0.4,
       max_tokens: 2200,
       response_format: { type: "json_object" },
-    }, { timeout: 18_000 });
+    }, { timeout: 8_000 });
   } catch (err) {
     console.warn("AI 调用失败，使用 mock 兜底:", err instanceof Error ? err.message : err);
     const mock = generateMockReplan(body);

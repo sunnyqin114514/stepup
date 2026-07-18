@@ -124,7 +124,11 @@ ${formatSteps(body.task.steps)}
 3. 语言简洁，不要客套，不要输出 JSON`;
 
   try {
-    const { client, model } = createAiClient();
+    const ai = createAiClient();
+    if (!ai) {
+      throw new Error("AI client unavailable: missing DeepSeek key and Netlify AI Gateway key");
+    }
+    const { client, model } = ai;
     const completion = await client.chat.completions.create({
       model,
       messages: [

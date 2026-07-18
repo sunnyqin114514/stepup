@@ -14,7 +14,7 @@ import {
   parseLocalDate,
   snapToNextExecutableDay,
 } from "../../src/lib/scheduleDates";
-import { compactPlainText, stripMarkdown } from "../../src/lib/textSanitize";
+import { compactPlainText } from "../../src/lib/textSanitize";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
 import {
   consumeAiQuota,
@@ -192,7 +192,7 @@ function sanitizeTask(raw: unknown): Omit<
     const parsed = r.steps
       .map((s) => {
         if (typeof s === "string") {
-          const action = s.trim().slice(0, 80);
+          const action = compactString(s, 80);
           return action ? { action } : null;
         }
         if (s && typeof s === "object") {
@@ -234,10 +234,9 @@ function sanitizeTask(raw: unknown): Omit<
       steps = parsed.slice(0, 8);
     }
   }
-  const checkRaw = String(
-    r.checkCriteria ?? r.acceptanceCriteria ?? r.doneWhen ?? ""
-  ).trim();
-  const checkCriteria = checkRaw ? checkRaw.slice(0, 120) : undefined;
+  const checkCriteria =
+    compactString(r.checkCriteria ?? r.acceptanceCriteria ?? r.doneWhen ?? "", 120) ||
+    undefined;
   const suggestedMinutes = Number(r.suggestedMinutes ?? r.minutes) || 30;
   const priorityRaw = String(r.priority ?? "medium");
   const priority: Priority =
@@ -252,15 +251,21 @@ function sanitizeTask(raw: unknown): Omit<
     subject: subject || undefined,
     suggestedMinutes,
     priority,
-    foundation: String(r.foundation ?? "").trim().slice(0, 300) || undefined,
-    weakness: String(r.weakness ?? "").trim().slice(0, 300) || undefined,
+    foundation: compactString(r.foundation ?? "", 300) || undefined,
+    weakness: compactString(r.weakness ?? "", 300) || undefined,
     topicTags: Array.isArray(r.topicTags)
-      ? r.topicTags.map(String).map((tag) => tag.trim()).filter(Boolean).slice(0, 8)
+      ? r.topicTags
+          .map((tag) => compactString(tag, 40))
+          .filter(Boolean)
+          .slice(0, 8)
       : [],
     priorityReason: compactString(r.priorityReason ?? "", 200) || undefined,
     sourceReason: compactString(r.sourceReason ?? "", 200) || undefined,
     resourceSuggestions: Array.isArray(r.resourceSuggestions)
-      ? r.resourceSuggestions.map(String).map((item) => item.trim()).filter(Boolean).slice(0, 8)
+      ? r.resourceSuggestions
+          .map((item) => compactString(item, 80))
+          .filter(Boolean)
+          .slice(0, 8)
       : [],
     reviewIntervals: Array.isArray(r.reviewIntervals)
       ? r.reviewIntervals.map(Number).filter((day) => [3, 7, 14, 30].includes(day))
@@ -839,6 +844,77 @@ function extractScheduleFromParsed(
   return { workDates, restDates };
 }
 
+function cleanFinalSteps(
+  task: Omit<TaskItem, "id" | "completed" | "focusSeconds">,
+  checkCriteria: string,
+): TaskItem["steps"] {
+  const rawSteps = task.steps?.length
+    ? task.steps
+    : buildFallbackStepsForTask(
+        task.title,
+        task.subject,
+        task.suggestedMinutes,
+        checkCriteria,
+      );
+
+  const steps = rawSteps
+    .map((step) => {
+      if (typeof step === "string") {
+        const action = compactString(step, 80);
+        return action ? { action } : null;
+      }
+
+      const action = compactString(step.action, 80);
+      if (!action) return null;
+      const guide = compactString(step.guide ?? "", 360);
+      const goal = compactString(step.goal ?? "", 180);
+      const check = compactString(step.checkCriteria ?? "", 180);
+      const microActions = Array.isArray(step.microActions)
+        ? step.microActions
+            .map((item) => {
+              const text = compactString(item.text, 180);
+              if (!text) return null;
+              const material = compactString(item.material ?? "", 120);
+              const sourceRef = compactString(item.sourceRef ?? "", 120);
+              const timeLimit = compactString(item.timeLimit ?? "", 60);
+              return {
+                text,
+                ...(material ? { material } : {}),
+                ...(sourceRef ? { sourceRef } : {}),
+                ...(timeLimit ? { timeLimit } : {}),
+              };
+            })
+            .filter((item): item is NonNullable<typeof item> => item !== null)
+            .slice(0, 5)
+        : undefined;
+      const blockers = Array.isArray(step.blockers)
+        ? step.blockers
+            .map((item) => {
+              const problem = compactString(item.problem, 120);
+              const solution = compactString(item.solution, 180);
+              return problem && solution ? { problem, solution } : null;
+            })
+            .filter((item): item is NonNullable<typeof item> => item !== null)
+            .slice(0, 3)
+        : undefined;
+
+      return {
+        action,
+        ...(guide ? { guide } : {}),
+        ...(goal ? { goal } : {}),
+        ...(Number.isFinite(Number(step.minutes)) && Number(step.minutes) > 0
+          ? { minutes: Math.min(60, Math.max(5, Math.round(Number(step.minutes)))) }
+          : {}),
+        ...(microActions?.length ? { microActions } : {}),
+        ...(check ? { checkCriteria: check } : {}),
+        ...(blockers?.length ? { blockers } : {}),
+      };
+    })
+    .filter((step): step is NonNullable<typeof step> => step !== null);
+
+  return steps.length ? steps : undefined;
+}
+
 function finalizeScheduledTasks(
   req: DecomposeRequest,
   tasks: Array<Omit<TaskItem, "id" | "completed" | "focusSeconds">>,
@@ -894,18 +970,35 @@ function finalizeScheduledTasks(
 
   const capped = distributed.map((t) => {
     const checkCriteria =
-      stripMarkdown(t.checkCriteria ?? "").trim() ||
+      compactString(t.checkCriteria ?? "", 180) ||
       `完成「${t.title}」并留下可核对的产出（笔记/文件/截图/可演示结果）`;
-    const steps = t.steps?.length
-      ? t.steps
-      : buildFallbackStepsForTask(t.title, t.subject, t.suggestedMinutes, checkCriteria);
+    const title = compactString(t.title, 50);
+    const subject = t.subject ? compactString(t.subject, 60) : undefined;
+    const description = compactString(t.description, 80);
+    const steps = cleanFinalSteps(
+      { ...t, title, subject, description, checkCriteria },
+      checkCriteria,
+    );
     return {
       ...t,
-      title: stripMarkdown(t.title),
-      description: stripMarkdown(t.description),
-      subject: t.subject ? stripMarkdown(t.subject) : undefined,
+      title,
+      description,
+      subject,
       checkCriteria,
       steps,
+      foundation: t.foundation ? compactString(t.foundation, 300) : undefined,
+      weakness: t.weakness ? compactString(t.weakness, 300) : undefined,
+      topicTags: Array.isArray(t.topicTags)
+        ? t.topicTags.map((tag) => compactString(tag, 40)).filter(Boolean).slice(0, 8)
+        : [],
+      priorityReason: t.priorityReason ? compactString(t.priorityReason, 200) : undefined,
+      sourceReason: t.sourceReason ? compactString(t.sourceReason, 200) : undefined,
+      resourceSuggestions: Array.isArray(t.resourceSuggestions)
+        ? t.resourceSuggestions
+            .map((item) => compactString(item, 80))
+            .filter(Boolean)
+            .slice(0, 8)
+        : [],
     };
   });
 
@@ -1092,7 +1185,11 @@ export default async (req: Request): Promise<Response> => {
 
   let content = "";
   try {
-    const { client, model } = createAiClient();
+    const ai = createAiClient();
+    if (!ai) {
+      throw new Error("AI client unavailable: missing DeepSeek key and Netlify AI Gateway key");
+    }
+    const { client, model } = ai;
     const messages = [
       {
         role: "system" as const,
@@ -1114,7 +1211,7 @@ export default async (req: Request): Promise<Response> => {
           ...baseRequest,
           response_format: { type: "json_object" },
         },
-        { timeout: 18_000 },
+        { timeout: 7_500 },
       );
       content = completion.choices?.[0]?.message?.content ?? "";
     } catch (err) {
@@ -1129,7 +1226,7 @@ export default async (req: Request): Promise<Response> => {
 
       console.warn("AI JSON 模式不可用，降级为普通 JSON 提示:", message);
       const completion = await client.chat.completions.create(baseRequest, {
-        timeout: 8_000,
+        timeout: 7_000,
       });
       content = completion.choices?.[0]?.message?.content ?? "";
     }

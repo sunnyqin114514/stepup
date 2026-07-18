@@ -160,7 +160,11 @@ export default async (req: Request): Promise<Response> => {
 只输出 JSON，不要解释。`;
 
     try {
-      const { client, model } = createAiClient();
+      const ai = createAiClient();
+      if (!ai) {
+        throw new Error("AI client unavailable: missing DeepSeek key and Netlify AI Gateway key");
+      }
+      const { client, model } = ai;
       const completion = await client.chat.completions.create({
         model,
         messages: [

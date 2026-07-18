@@ -164,7 +164,11 @@ moduleAccuracy 为模块名到 0-100 正确率；reinforcementTasks 为 1-4 条 
   let review = fallback;
   let mock = false;
   try {
-    const { client, model } = createAiClient();
+    const ai = createAiClient();
+    if (!ai) {
+      throw new Error("AI client unavailable: missing DeepSeek key and Netlify AI Gateway key");
+    }
+    const { client, model } = ai;
     const completion = await client.chat.completions.create({
       model,
       messages: [

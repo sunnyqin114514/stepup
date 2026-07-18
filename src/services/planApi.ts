@@ -71,13 +71,13 @@ export async function syncDevProEntitlement(pro: boolean): Promise<{
 export async function decomposePlan(
   req: DecomposeRequest
 ): Promise<DecomposeResponse> {
-  return postJSON<DecomposeResponse>("/api/decompose", req, { timeoutMs: 90_000 });
+  return postJSON<DecomposeResponse>("/api/decompose", req, { timeoutMs: 20_000 });
 }
 
 export async function replanPlan(
   req: ReplanRequest
 ): Promise<ReplanResponse> {
-  return postJSON<ReplanResponse>("/api/replan", req, { timeoutMs: 60_000 });
+  return postJSON<ReplanResponse>("/api/replan", req, { timeoutMs: 20_000 });
 }
 
 export async function askTaskHelp(

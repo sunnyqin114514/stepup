@@ -24,4 +24,9 @@ describe("textSanitize", () => {
   it("过滤控制字符", () => {
     expect(stripMarkdown("正常\u0001文本")).toBe("正常文本");
   });
+
+  it("修复常见 mojibake、HTML 实体和替换字符", () => {
+    expect(stripMarkdown("ä½ å¥½ &amp; **任务** �")).toBe("你好 & 任务");
+    expect(stripMarkdown("＃＃ 今日&nbsp;目标\n＊ 完成")).toBe("今日 目标\n完成");
+  });
 });

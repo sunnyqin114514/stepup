@@ -14,14 +14,25 @@ export type AiClient = {
   model: string;
 };
 
+function env(name: string): string | undefined {
+  try {
+    const netlifyValue =
+      typeof Netlify !== "undefined" ? Netlify.env?.get?.(name) : undefined;
+    const processValue =
+      typeof process !== "undefined" ? process.env?.[name] : undefined;
+    return netlifyValue || processValue || undefined;
+  } catch (error) {
+    console.error(`读取环境变量 ${name} 失败`, error);
+    return undefined;
+  }
+}
+
 // 创建 AI 客户端：
 // 1. 优先使用 DEEPSEEK_API_KEY（本地开发用用户自己的 key）
-// 2. 否则用默认 OpenAI 构造（部署到 Netlify 后由 AI Gateway 自动注入 key）
-export function createAiClient(): AiClient {
-  const deepseekKey =
-    (typeof Netlify !== "undefined" && Netlify.env?.get?.("DEEPSEEK_API_KEY")) ||
-    (typeof process !== "undefined" && process.env?.DEEPSEEK_API_KEY) ||
-    undefined;
+// 2. 否则使用 Netlify AI Gateway 注入的 OPENAI_API_KEY / OPENAI_BASE_URL
+// 3. 两者都不可用时返回 null，由调用方快速走场景化 mock，避免函数 502
+export function createAiClient(): AiClient | null {
+  const deepseekKey = env("DEEPSEEK_API_KEY");
 
   if (deepseekKey) {
     return {
@@ -33,9 +44,19 @@ export function createAiClient(): AiClient {
     };
   }
 
-  // 走 Netlify AI Gateway（生产部署后自动激活）
+  const openAiKey = env("OPENAI_API_KEY");
+  const openAiBaseUrl = env("OPENAI_BASE_URL");
+  if (!openAiKey) {
+    return null;
+  }
+
+  // 走 Netlify AI Gateway（生产部署后自动激活）。显式传入 key/baseURL，
+  // 避免 SDK 在无 key 环境下构造时抛出未捕获错误。
   return {
-    client: new OpenAI(),
+    client: new OpenAI({
+      apiKey: openAiKey,
+      ...(openAiBaseUrl ? { baseURL: openAiBaseUrl } : {}),
+    }),
     model: NETLIFY_MODEL,
   };
 }
@@ -48,15 +69,15 @@ export function createAiClient(): AiClient {
 
 function isDevEnvironment(): boolean {
   // Vite dev server
-  if (typeof process !== "undefined" && process.env?.NODE_ENV === "development") {
+  if (env("NODE_ENV") === "development") {
     return true;
   }
   // Netlify Dev
-  if (typeof process !== "undefined" && process.env?.NETLIFY_DEV === "true") {
+  if (env("NETLIFY_DEV") === "true") {
     return true;
   }
   // 用户在 .env 里设的紧急开关
-  if (typeof process !== "undefined" && process.env?.DISABLE_ORIGIN_CHECK === "true") {
+  if (env("DISABLE_ORIGIN_CHECK") === "true") {
     return true;
   }
   return false;
@@ -74,9 +95,16 @@ export function checkOrigin(req: Request): boolean {
   // 允许 vercel preview 等
   if (origin.endsWith(".vercel.app")) return true;
 
+  const builtinOrigins = new Set([
+    "http://tcamp14.cn",
+    "https://tcamp14.cn",
+    "http://www.tcamp14.cn",
+    "https://www.tcamp14.cn",
+  ]);
+  if (builtinOrigins.has(origin)) return true;
+
   // 额外允许的域名（通过环境变量配置，多个用逗号分隔）
-  const extraOrigins =
-    (typeof process !== "undefined" && process.env?.ALLOWED_ORIGINS) || "";
+  const extraOrigins = env("ALLOWED_ORIGINS") || "";
   if (extraOrigins) {
     const list = extraOrigins.split(",").map((s) => s.trim()).filter(Boolean);
     if (list.includes(origin)) return true;
