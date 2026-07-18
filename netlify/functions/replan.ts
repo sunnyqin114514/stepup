@@ -534,7 +534,7 @@ export default async (req: Request): Promise<Response> => {
         max_tokens: 3200,
         response_format: { type: "json_object" },
       },
-      { timeout: 8_000 },
+      { timeout: 12_000 },
     );
   } catch (err) {
     console.warn(

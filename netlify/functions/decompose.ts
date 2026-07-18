@@ -987,7 +987,7 @@ export default async (req: Request): Promise<Response> => {
           ...baseRequest,
           response_format: { type: "json_object" },
         },
-        { timeout: 7_500 },
+        { timeout: 12_000 },
       );
       content = completion.choices?.[0]?.message?.content ?? "";
     } catch (err) {
@@ -1002,7 +1002,7 @@ export default async (req: Request): Promise<Response> => {
 
       console.warn("AI JSON 模式不可用，降级为普通 JSON 提示:", message);
       const completion = await client.chat.completions.create(baseRequest, {
-        timeout: 7_000,
+        timeout: 10_000,
       });
       content = completion.choices?.[0]?.message?.content ?? "";
     }
