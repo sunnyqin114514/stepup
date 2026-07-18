@@ -336,7 +336,8 @@ export default function PlannerPage() {
 
       const res = await replanPlan({
         plan: { ...plan, dailyMinutes },
-        difficulty: adjustNote.trim() || "用户主动请求调整日程",
+        // 空指令 = 只重排日期；有指令才改写任务内容/步骤
+        difficulty: adjustNote.trim(),
         tomorrowMinutes: allocated,
         globalDailyCap: cap,
         allocatedDailyMinutes: allocated,
@@ -755,11 +756,11 @@ export default function PlannerPage() {
           <div className="card p-5 mb-6">
             <h2 className="font-semibold text-slate-900 mb-1">调整日程</h2>
             <p className="text-xs text-slate-500 mb-3">
-              主动请求 AI 重新安排本目标的未完成任务。日常收工不会走这里。
+              填写具体指令会改写任务内容与步骤；留空则只重排日期节奏，执行细节保持不变。
             </p>
             <textarea
               className="input-field min-h-[64px] mb-3"
-              placeholder="例如：想把节奏放慢 / 数学部分提前"
+              placeholder="例如：节奏放慢并增加休息 / 把数学提前并加强错题订正"
               value={adjustNote}
               onChange={(e) => setAdjustNote(e.target.value)}
             />

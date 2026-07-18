@@ -16,6 +16,8 @@ import {
 } from "../../src/lib/scheduleDates";
 import { compactPlainText } from "../../src/lib/textSanitize";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
+import { buildFallbackStepsForTask } from "./_shared/taskDetail";
+import { sanitizeFullTask } from "./_shared/taskSanitize";
 import {
   consumeAiQuota,
   getRequestEntitlement,
@@ -46,17 +48,17 @@ function buildPrompt(req: DecomposeRequest): string {
   let strategy: string;
   let taskCountHint: string;
   if (executableCount <= 7) {
-    strategy = "短期冲刺：覆盖几乎每个可执行日，每天 1-2 个任务";
-    taskCountHint = `${Math.min(executableCount * 2, 10)} 个任务左右`;
+    strategy = "短期冲刺：几乎每个可执行日都有任务，每天 1-2 个";
+    taskCountHint = `${Math.min(executableCount * 2, 14)} 个任务左右`;
   } else if (executableCount <= 30) {
-    strategy = "月度计划：任务日期均匀落在推荐工作日，覆盖从今天到截止前";
-    taskCountHint = `${Math.min(Math.max(8, Math.ceil(executableCount * 0.7)), 16)} 个任务`;
+    strategy = "月度计划：约每天 1 个可执行任务，前中后三段都要有实质练习";
+    taskCountHint = `${Math.min(Math.max(12, Math.ceil(executableCount * 1.05)), 28)} 个任务`;
   } else if (executableCount <= 90) {
-    strategy = "季度计划：按周推进，任务覆盖前期诊断、中期专项、后期模拟";
-    taskCountHint = `${Math.min(Math.max(10, Math.ceil(executableCount * 0.35)), 20)} 个任务`;
+    strategy = "季度计划：按周推进，每周至少 3-4 个具体练习任务，覆盖诊断/专项/模拟";
+    taskCountHint = `${Math.min(Math.max(18, Math.ceil(executableCount * 0.55)), 36)} 个任务`;
   } else {
-    strategy = "长期计划：按阶段里程碑分布，仍需覆盖开始、中段与冲刺";
-    taskCountHint = `${Math.min(Math.max(12, Math.ceil(executableCount * 0.2)), 24)} 个任务`;
+    strategy = "长期计划：按阶段里程碑密集排布，开始、中段、冲刺周都要有实质任务";
+    taskCountHint = `${Math.min(Math.max(24, Math.ceil(executableCount * 0.35)), 42)} 个任务`;
   }
 
   const unfinishedTasks = (req.unfinishedTasks ?? [])
@@ -101,8 +103,8 @@ function buildPrompt(req: DecomposeRequest): string {
 
 硬性规则：
 1. date 必须在推荐工作日上；day1 必须是 ${todayStr}（若今天不可执行则用最近工作日）。
-2. 每天总分钟数 ≤ ${Math.round(dailyBudget * 0.9)}，同一天最多 3 个任务。
-3. 任务日期必须覆盖前期、中期、冲刺：最早任务在开始 3 天内，最晚任务在截止前 7 天内。
+2. 每天总分钟数 ≤ ${Math.round(dailyBudget * 0.9)}，同一天最多 3 个任务；有任务的日子尽量用到预算的 60%-90%，禁止大量空档日。
+3. 任务日期必须覆盖前期、中期、冲刺：最早任务在开始 3 天内，最晚任务在截止前 7 天内；相邻有任务的工作日间隔尽量不超过 2 天。
 4. 备考目标必须拆到考试模块/题型/练习动作；禁止“澄清目标/成功标准/搭建框架”。
 5. 工作/项目目标才允许需求澄清、交付、评审类任务。
 6. 薄弱领域相关任务占比不少于 30%。
@@ -116,165 +118,6 @@ function buildPrompt(req: DecomposeRequest): string {
 
 function compactString(value: unknown, maxLength: number): string {
   return compactPlainText(value, maxLength);
-}
-
-function sanitizeMicroActions(raw: unknown) {
-  if (!Array.isArray(raw)) return undefined;
-  const items = raw
-    .map((item) => {
-      if (typeof item === "string") {
-        const text = compactString(item, 160);
-        return text ? { text } : null;
-      }
-      if (!item || typeof item !== "object") return null;
-      const object = item as Record<string, unknown>;
-      const text = compactString(
-        object.text ?? object.action ?? object.title ?? object["具体动作"],
-        180,
-      );
-      if (!text) return null;
-      const material = compactString(
-        object.material ?? object.source ?? object["材料来源"],
-        120,
-      );
-      const sourceRef = compactString(
-        object.sourceRef ?? object.reference ?? object.ref ?? object["页码/题号"],
-        120,
-      );
-      const timeLimit = compactString(
-        object.timeLimit ?? object.duration ?? object["时间限制"],
-        60,
-      );
-      return {
-        text,
-        ...(material ? { material } : {}),
-        ...(sourceRef ? { sourceRef } : {}),
-        ...(timeLimit ? { timeLimit } : {}),
-      };
-    })
-    .filter((item): item is NonNullable<typeof item> => item !== null)
-    .slice(0, 5);
-
-  return items.length ? items : undefined;
-}
-
-function sanitizeBlockers(raw: unknown) {
-  if (!Array.isArray(raw)) return undefined;
-  const items = raw
-    .map((item) => {
-      if (typeof item === "string") {
-        const problem = compactString(item, 120);
-        return problem ? { problem, solution: "先缩小动作范围，只完成最小可检查产出，再继续下一步。" } : null;
-      }
-      if (!item || typeof item !== "object") return null;
-      const object = item as Record<string, unknown>;
-      const problem = compactString(object.problem ?? object.issue ?? object["卡点"], 120);
-      const solution = compactString(object.solution ?? object.fix ?? object["解法"], 180);
-      return problem && solution ? { problem, solution } : null;
-    })
-    .filter((item): item is NonNullable<typeof item> => item !== null)
-    .slice(0, 3);
-
-  return items.length ? items : undefined;
-}
-
-function sanitizeTask(raw: unknown): Omit<
-  TaskItem,
-  "id" | "completed" | "focusSeconds"
-> | null {
-  if (!raw || typeof raw !== "object") return null;
-  const r = raw as Record<string, unknown>;
-  const date = String(r.date ?? "");
-  const title = compactString(r.title ?? r.content ?? "", 50);
-  const subject = compactString(r.subject ?? r.module ?? r.subGoal ?? "", 60);
-  const description = compactString(r.description ?? r.content ?? "", 80);
-  let steps: TaskItem["steps"] | undefined;
-  if (Array.isArray(r.steps)) {
-    const parsed = r.steps
-      .map((s) => {
-        if (typeof s === "string") {
-          const action = compactString(s, 80);
-          return action ? { action } : null;
-        }
-        if (s && typeof s === "object") {
-          const o = s as Record<string, unknown>;
-          const action = compactString(
-            o.action ?? o.title ?? o.step ?? o["步骤标题"] ?? "",
-            80,
-          );
-          if (!action) return null;
-          const guide = compactString(o.guide ?? o.howTo ?? o["操作指引"], 360);
-          const goal = compactString(o.goal ?? o.result ?? o["目标"], 180);
-          const minutes = Number(o.minutes ?? o.suggestedMinutes ?? o["预计用时"]);
-          const microActions = sanitizeMicroActions(
-            o.microActions ?? o.actions ?? o.checklist ?? o["微动作清单"],
-          );
-          const checkCriteria = compactString(
-            o.checkCriteria ?? o.acceptanceCriteria ?? o.doneWhen ?? o["自检标准"],
-            180,
-          );
-          const blockers = sanitizeBlockers(
-            o.blockers ?? o.commonBlockers ?? o["常见卡点"] ?? o["常见卡点 & 解法"],
-          );
-          return {
-            action,
-            ...(guide ? { guide } : {}),
-            ...(goal ? { goal } : {}),
-            ...(Number.isFinite(minutes) && minutes > 0
-              ? { minutes: Math.min(60, Math.max(5, Math.round(minutes))) }
-              : {}),
-            ...(microActions ? { microActions } : {}),
-            ...(checkCriteria ? { checkCriteria } : {}),
-            ...(blockers ? { blockers } : {}),
-          };
-        }
-        return null;
-      })
-      .filter((s): s is { action: string; guide?: string } => s !== null);
-    if (parsed.length >= 1) {
-      steps = parsed.slice(0, 8);
-    }
-  }
-  const checkCriteria =
-    compactString(r.checkCriteria ?? r.acceptanceCriteria ?? r.doneWhen ?? "", 120) ||
-    undefined;
-  const suggestedMinutes = Number(r.suggestedMinutes ?? r.minutes) || 30;
-  const priorityRaw = String(r.priority ?? "medium");
-  const priority: Priority =
-    priorityRaw === "high" || priorityRaw === "low"
-      ? priorityRaw
-      : "medium";
-  if (!date || !title) return null;
-  const result: Omit<TaskItem, "id" | "completed" | "focusSeconds"> = {
-    date,
-    title,
-    description,
-    subject: subject || undefined,
-    suggestedMinutes,
-    priority,
-    foundation: compactString(r.foundation ?? "", 300) || undefined,
-    weakness: compactString(r.weakness ?? "", 300) || undefined,
-    topicTags: Array.isArray(r.topicTags)
-      ? r.topicTags
-          .map((tag) => compactString(tag, 40))
-          .filter(Boolean)
-          .slice(0, 8)
-      : [],
-    priorityReason: compactString(r.priorityReason ?? "", 200) || undefined,
-    sourceReason: compactString(r.sourceReason ?? "", 200) || undefined,
-    resourceSuggestions: Array.isArray(r.resourceSuggestions)
-      ? r.resourceSuggestions
-          .map((item) => compactString(item, 80))
-          .filter(Boolean)
-          .slice(0, 8)
-      : [],
-    reviewIntervals: Array.isArray(r.reviewIntervals)
-      ? r.reviewIntervals.map(Number).filter((day) => [3, 7, 14, 30].includes(day))
-      : [3, 7, 14, 30],
-  };
-  if (steps) result.steps = steps;
-  if (checkCriteria) result.checkCriteria = checkCriteria;
-  return result;
 }
 
 function tryParseJson(text: string): unknown | null {
@@ -358,7 +201,7 @@ function recoverPartialTaskObjects(text: string): unknown[] {
     seen.add(snippet);
     try {
       const parsed = JSON.parse(snippet.replace(/,\s*([}\]])/g, "$1"));
-      if (sanitizeTask(parsed)) recovered.push(parsed);
+      if (sanitizeFullTask(parsed)) recovered.push(parsed);
     } catch {
       // Ignore non-task nested objects or malformed fragments.
     }
@@ -783,9 +626,9 @@ function generateMockTasks(req: DecomposeRequest): Omit<
   const workDays = days.length > 0 ? days : [today];
 
   const templates = pickMockTemplates(req);
-  const count = Math.min(
-    templates.length,
-    Math.max(5, Math.min(18, Math.ceil(workDays.length * 0.75))),
+  const count = Math.max(
+    6,
+    Math.min(28, Math.ceil(workDays.length * 0.95)),
   );
 
   const perDayMinutes = resolveDailyBudget(req);
@@ -1051,76 +894,6 @@ function buildMockStep(
   };
 }
 
-function buildFallbackStepsForTask(
-  title: string,
-  subject: string | undefined,
-  minutes: number,
-  checkCriteria: string,
-) {
-  const stepMinutes = Math.max(15, Math.min(25, Math.round(minutes / 2)));
-  const moduleName = subject || "当前任务";
-  return [
-    {
-      action: `准备${moduleName}材料并限时完成`,
-      goal: `完成「${title}」的第一轮输入或练习`,
-      minutes: stepMinutes,
-      guide: `1.找到${moduleName}相关材料；2.计时${stepMinutes}分钟完成；3.记录正确数或产出`,
-      microActions: [
-        {
-          text: `打开${moduleName}相关真题、讲义或知识库资料`,
-          material: `${moduleName}真题/讲义/知识库`,
-          sourceRef: "当前资料同类题或同类段落",
-          timeLimit: "5分钟",
-        },
-        {
-          text: `围绕「${title}」完成一轮限时练习或产出`,
-          material: `${moduleName}练习材料`,
-          sourceRef: "当前资料第 1 组",
-          timeLimit: `${stepMinutes}分钟`,
-        },
-      ],
-      checkCriteria,
-      blockers: [
-        {
-          problem: "不知道用哪份材料",
-          solution: `优先使用最近一次错题、知识库资料或搜索「${moduleName} 高频题」。`,
-        },
-        {
-          problem: "时间不够完成全部内容",
-          solution: "先完成一组最小练习并记录错因，不临时扩大范围。",
-        },
-      ],
-    },
-    {
-      action: "订正结果并记录卡点",
-      goal: "把本次练习转成可复盘的错题或笔记",
-      minutes: Math.max(10, Math.min(20, minutes - stepMinutes)),
-      guide: "1.对照答案或标准；2.标出错因；3.写下下一次避免方法",
-      microActions: [
-        {
-          text: "对答案并统计正确数、错误数和耗时",
-          material: "答案解析/评分标准",
-          sourceRef: "本轮练习结果",
-          timeLimit: "5分钟",
-        },
-        {
-          text: "把最关键的 2-3 个错误写入错题表",
-          material: "错题表/复盘笔记",
-          sourceRef: "错题编号或原句",
-          timeLimit: "10分钟",
-        },
-      ],
-      checkCriteria,
-      blockers: [
-        {
-          problem: "看了解析还是不懂",
-          solution: "只保留最卡的一题，向 AI 提问并附上题干、你的答案和解析原文。",
-        },
-      ],
-    },
-  ];
-}
-
 export default async (req: Request): Promise<Response> => {
   if (req.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
@@ -1266,7 +1039,7 @@ export default async (req: Request): Promise<Response> => {
     });
   }
   let tasks = arr
-    .map(sanitizeTask)
+    .map(sanitizeFullTask)
     .filter((t): t is NonNullable<typeof t> => t !== null);
 
   if (usedRecoveredJson && tasks.length > 0 && tasks.length < 5) {

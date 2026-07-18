@@ -58,6 +58,32 @@ describe("scheduleDates", () => {
     expect(new Set(placed.map((t) => t.date)).size).toBeGreaterThan(1);
   });
 
+  it("少量任务不会被摊到全部工作日造成大片空档", () => {
+    const workDates = Array.from({ length: 20 }, (_, i) => {
+      const d = new Date(2026, 6, 20);
+      d.setDate(d.getDate() + i);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    });
+    const tasks = Array.from({ length: 6 }, (_, i) => ({
+      date: workDates[0],
+      suggestedMinutes: 60,
+      title: `t${i}`,
+    }));
+    const placed = distributeTasksToWorkDates(
+      tasks,
+      workDates,
+      90,
+      "2026-09-01",
+    );
+    const usedDates = new Set(placed.map((t) => t.date));
+    // 6 个任务应落在约 6 个锚点日，而不是稀疏散在 20 天
+    expect(usedDates.size).toBeLessThanOrEqual(8);
+    expect(usedDates.size).toBeGreaterThanOrEqual(4);
+  });
+
   it("多目标全局预算按紧迫度分配且不超过上限", () => {
     const budgets = allocateGlobalDailyBudgets(
       [

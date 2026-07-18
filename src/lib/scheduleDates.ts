@@ -146,8 +146,21 @@ export function buildDefaultSchedule(
   return { workDates, restDates };
 }
 
+/** 从全量工作日中挑出 count 个锚点日（含首尾），避免任务摊得过稀 */
+function pickSpacedDates(dates: string[], count: number): string[] {
+  if (count >= dates.length) return dates.slice();
+  if (count <= 1) return [dates[0]];
+  const picked: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const idx = Math.round((i / (count - 1)) * (dates.length - 1));
+    picked.push(dates[idx]);
+  }
+  return [...new Set(picked)];
+}
+
 /**
- * 把任务均匀铺到工作日，并保证每日不超过预算；超预算顺延到下一工作日。
+ * 把任务铺到工作日：先按「需要的天数」抽锚点覆盖全程，再在锚点上顺序填满预算。
+ * 避免把少量任务均匀摊到全部工作日造成大片空档。
  */
 export function distributeTasksToWorkDates<
   T extends { date: string; suggestedMinutes: number },
@@ -166,32 +179,44 @@ export function distributeTasksToWorkDates<
   );
   if (validDates.length === 0) return tasks;
 
-  return tasks.map((task, i) => {
-    const preferred = Math.min(
-      validDates.length - 1,
-      Math.floor((i / Math.max(1, tasks.length)) * validDates.length),
-    );
-    let minutes = Math.max(15, Math.min(budget, Number(task.suggestedMinutes) || 30));
-    let date = validDates[preferred];
+  const totalMinutes = tasks.reduce(
+    (sum, task) =>
+      sum + Math.max(15, Math.min(budget, Number(task.suggestedMinutes) || 30)),
+    0,
+  );
+  const daysNeeded = Math.min(
+    validDates.length,
+    Math.max(tasks.length, Math.ceil(totalMinutes / budget)),
+  );
+  const packDates = pickSpacedDates(validDates, daysNeeded);
+  let cursor = 0;
 
-    // 1) 优先找能完整放下的工作日
+  return tasks.map((task) => {
+    let minutes = Math.max(
+      15,
+      Math.min(budget, Number(task.suggestedMinutes) || 30),
+    );
+    let date = packDates[Math.min(cursor, packDates.length - 1)];
     let placed = false;
-    for (let attempt = 0; attempt < validDates.length; attempt += 1) {
-      const candidate = validDates[(preferred + attempt) % validDates.length];
+
+    // 1) 从当前锚点起向后找能完整放下的一天（顺序填满，不回头摊薄）
+    for (let attempt = cursor; attempt < packDates.length; attempt += 1) {
+      const candidate = packDates[attempt];
       const already = used[candidate] ?? 0;
       if (already + minutes <= budget) {
         date = candidate;
         used[candidate] = already + minutes;
+        cursor = attempt;
         placed = true;
         break;
       }
     }
 
-    // 2) 否则放到剩余容量最大的一天，并收缩时长以不超预算
+    // 2) 否则放到剩余容量最大的锚点日，并收缩时长
     if (!placed) {
-      let bestDate = validDates[0];
+      let bestDate = packDates[packDates.length - 1];
       let bestRemain = -1;
-      for (const candidate of validDates) {
+      for (const candidate of packDates) {
         const remain = budget - (used[candidate] ?? 0);
         if (remain > bestRemain) {
           bestRemain = remain;
@@ -203,10 +228,9 @@ export function distributeTasksToWorkDates<
         minutes = Math.min(minutes, bestRemain);
         used[date] = (used[date] ?? 0) + minutes;
       } else {
-        // 所有天都几乎满了：仍放到负载最轻的一天（不可避免轻微超载）
-        let lightest = validDates[0];
+        let lightest = packDates[0];
         let lightestUsed = Number.POSITIVE_INFINITY;
-        for (const candidate of validDates) {
+        for (const candidate of packDates) {
           const already = used[candidate] ?? 0;
           if (already < lightestUsed) {
             lightestUsed = already;
