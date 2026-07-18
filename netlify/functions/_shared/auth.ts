@@ -40,6 +40,10 @@ export function isAuthResponse(value: AppUser | Response): value is Response {
   return value instanceof Response;
 }
 
+export function isTesterModeRequest(req: Request): boolean {
+  return req.headers.get("x-stepup-tester-mode") === "true";
+}
+
 export async function getEntitlement(userId: string): Promise<{
   plan: "free" | "pro";
   pro: boolean;
@@ -60,6 +64,18 @@ export async function getEntitlement(userId: string): Promise<{
   }
 }
 
+export async function getRequestEntitlement(
+  userId: string,
+  req: Request,
+): Promise<{
+  plan: "free" | "pro";
+  pro: boolean;
+  tester?: boolean;
+}> {
+  if (isTesterModeRequest(req)) return { plan: "pro", pro: true, tester: true };
+  return getEntitlement(userId);
+}
+
 export function createId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
@@ -67,7 +83,9 @@ export function createId(prefix: string): string {
 export async function consumeAiQuota(
   userId: string,
   action: "decompose" | "replan",
+  options?: { testerMode?: boolean },
 ): Promise<{ allowed: boolean; used: number; limit: number | null }> {
+  if (options?.testerMode) return { allowed: true, used: 0, limit: null };
   const entitlement = await getEntitlement(userId);
   if (entitlement.pro) return { allowed: true, used: 0, limit: null };
 

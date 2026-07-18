@@ -1,6 +1,6 @@
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { isProUnlocked } from "../lib/storage";
+import { isProUnlocked, isTesterModeEnabled } from "../lib/storage";
 import LogoMark from "./LogoMark";
 import AuthDialog from "./AuthDialog";
 import { useAuth } from "../auth/AuthContext";
@@ -20,18 +20,28 @@ export default function Layout() {
   const [pro, setPro] = useState<boolean>(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [dueCount, setDueCount] = useState(0);
+  const [testerModeVersion, setTesterModeVersion] = useState(0);
+  const testerHeaders: HeadersInit = isTesterModeEnabled()
+    ? { "X-StepUp-Tester-Mode": "true" }
+    : {};
+
+  useEffect(() => {
+    const refreshTesterMode = () => setTesterModeVersion((version) => version + 1);
+    window.addEventListener("stepup:tester-mode-change", refreshTesterMode);
+    return () => window.removeEventListener("stepup:tester-mode-change", refreshTesterMode);
+  }, []);
 
   useEffect(() => {
     if (!user && !import.meta.env.DEV) return;
-    if (import.meta.env.DEV) setPro(isProUnlocked());
+    if (import.meta.env.DEV || isTesterModeEnabled()) setPro(isProUnlocked());
     const loadDueCount = async () => {
       try {
-        const response = await fetch("/api/reviews");
+        const response = await fetch("/api/reviews", { headers: testerHeaders });
         if (!response.ok) throw new Error(`复习数量读取失败 (${response.status})`);
         const data = (await response.json()) as { dueCount?: number };
         setDueCount(Number(data.dueCount) || 0);
         if (!import.meta.env.DEV) {
-          const entitlementResponse = await fetch("/api/workspace");
+          const entitlementResponse = await fetch("/api/workspace", { headers: testerHeaders });
           if (!entitlementResponse.ok) throw new Error(`权益读取失败 (${entitlementResponse.status})`);
           const entitlementData = (await entitlementResponse.json()) as { entitlement?: { pro?: boolean } };
           setPro(Boolean(entitlementData.entitlement?.pro));
@@ -42,7 +52,7 @@ export default function Layout() {
       }
     };
     void loadDueCount();
-  }, [location.pathname, user]);
+  }, [location.pathname, user, testerModeVersion]);
 
   if (loading) {
     return <div className="min-h-full bg-[#F7F3EB] p-10 text-center text-sm text-stone-500">正在确认登录状态…</div>;

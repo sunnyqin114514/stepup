@@ -4,8 +4,10 @@ import { syncDevProEntitlement } from "../services/planApi";
 import {
   configureProEntitlement,
   getTrialInfo,
+  isTesterModeEnabled,
   isProUnlocked,
   setProUnlocked,
+  setTesterModeEnabled,
 } from "../lib/storage";
 
 const PLANS = [
@@ -49,25 +51,37 @@ const COMPARE = [
 
 export default function MembershipPage() {
   const development = import.meta.env.DEV;
-  const [pro, setPro] = useState<boolean>(() => development && isProUnlocked());
+  const [pro, setPro] = useState<boolean>(() => isProUnlocked());
   const [trial, setTrial] = useState(() => getTrialInfo());
   const [pickedPlan, setPickedPlan] = useState<string>("quarterly");
   const [showTrial, setShowTrial] = useState(false);
+  const [testerMode, setTesterMode] = useState(() => isTesterModeEnabled());
 
   useEffect(() => {
     const loadEntitlement = async () => {
       try {
-        const response = await fetch("/api/workspace");
+        const response = await fetch("/api/workspace", {
+          headers: testerMode ? { "X-StepUp-Tester-Mode": "true" } : {},
+        });
         if (!response.ok) throw new Error(`权益读取失败 (${response.status})`);
         const data = (await response.json()) as { entitlement?: { pro?: boolean } };
         if (!development) setPro(Boolean(data.entitlement?.pro));
       } catch (error) {
         console.error("服务端会员权益读取失败，生产按免费版降级", error);
-        if (!development) setPro(false);
+        if (!development) setPro(testerMode);
       }
     };
     void loadEntitlement();
-  }, [development]);
+  }, [development, testerMode]);
+
+  const handleTesterMode = (enabled: boolean) => {
+    setTesterModeEnabled(enabled);
+    setTesterMode(enabled);
+    configureProEntitlement(enabled);
+    setPro(enabled || (development && isProUnlocked()));
+    setTrial(enabled ? { active: true, daysRemaining: 999 } : getTrialInfo());
+    setShowTrial(enabled);
+  };
 
   const handleUnlock = async () => {
     if (!development) return;
@@ -182,6 +196,31 @@ export default function MembershipPage() {
             ? "仅本地开发模式可模拟解锁；生产权限只认服务端 user_entitlements。"
             : "生产权限由服务端 user_entitlements 判定，不读取 localStorage 演示状态。"}
         </p>
+      </div>
+
+      <div className="card mb-10 border-amber-200 bg-amber-50/60 p-5">
+        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h2 className="font-semibold text-slate-900">测试者模式</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              开启后当前浏览器账号可临时使用全部 Pro 功能：无限 AI、多目标、知识库与批量复习。
+            </p>
+            <p className="mt-1 text-xs text-amber-700">
+              仅用于测试，不代表正式付费权益；关闭后恢复服务端会员状态。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => handleTesterMode(!testerMode)}
+            className={`inline-flex items-center justify-center rounded-xl px-5 py-2.5 text-sm font-semibold transition ${
+              testerMode
+                ? "bg-rose-100 text-rose-700 hover:bg-rose-200"
+                : "bg-amber-400 text-stone-900 hover:bg-amber-500"
+            }`}
+          >
+            {testerMode ? "关闭测试者模式" : "开启测试者模式"}
+          </button>
+        </div>
       </div>
 
       {/* 功能对比 */}

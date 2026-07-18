@@ -9,7 +9,7 @@ import {
   tasks,
   userEntitlements,
 } from "../../db/schema";
-import { createId, getEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
+import { createId, getRequestEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
 
 type ImportedTask = {
   id?: string;
@@ -36,7 +36,7 @@ export default async (req: Request): Promise<Response> => {
   if (isAuthResponse(auth)) return auth;
   try {
     if (req.method === "GET") {
-      const entitlement = await getEntitlement(auth.id);
+      const entitlement = await getRequestEntitlement(auth.id, req);
       const [record] = await db
         .select({ migratedAt: userEntitlements.migratedAt })
         .from(userEntitlements)
@@ -138,7 +138,7 @@ export default async (req: Request): Promise<Response> => {
         return Response.json({ migrated: true, alreadyMigrated: true });
       }
 
-      const entitlement = await getEntitlement(auth.id);
+      const entitlement = await getRequestEntitlement(auth.id, req);
       let importedGoals = 0;
       let importedTasks = 0;
       let activeGoals = 0;

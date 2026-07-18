@@ -7,7 +7,7 @@ import {
   reviewSchedules,
   tasks,
 } from "../../db/schema";
-import { createId, getEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
+import { createId, getRequestEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
 import { nextReviewDate, normalizeIntervals } from "./_shared/resourceValidation";
 
 export default async (req: Request): Promise<Response> => {
@@ -54,7 +54,7 @@ export default async (req: Request): Promise<Response> => {
           ),
         )
         .orderBy(asc(reviewSchedules.dueAt));
-      const entitlement = await getEntitlement(auth.id);
+      const entitlement = await getRequestEntitlement(auth.id, req);
       return Response.json({ schedules, dueCount: schedules.length, entitlement });
     }
 
@@ -167,7 +167,7 @@ export default async (req: Request): Promise<Response> => {
         }, { status: 201 });
       }
       if (action === "batch") {
-        const entitlement = await getEntitlement(auth.id);
+        const entitlement = await getRequestEntitlement(auth.id, req);
         if (!entitlement.pro) return Response.json({ error: "批量提醒为 Pro 功能" }, { status: 403 });
         const ids = Array.isArray(body.scheduleIds) ? body.scheduleIds.map(String).slice(0, 100) : [];
         return Response.json({ accepted: ids.length, note: "站内批量提醒已启用；邮件/浏览器推送未配置外部 provider" });

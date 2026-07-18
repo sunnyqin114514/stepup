@@ -18,8 +18,9 @@ import { compactPlainText } from "../../src/lib/textSanitize";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
 import {
   consumeAiQuota,
-  getEntitlement,
+  getRequestEntitlement,
   isAuthResponse,
+  isTesterModeRequest,
   requireUser,
 } from "./_shared/auth";
 
@@ -1162,7 +1163,7 @@ export default async (req: Request): Promise<Response> => {
     (deadlineTime - Date.now()) / 86_400_000,
   );
   if (totalDays > 90) {
-    const entitlement = await getEntitlement(auth.id);
+    const entitlement = await getRequestEntitlement(auth.id, req);
     if (!entitlement.pro) {
       return Response.json(
         { error: "超过 90 天的全局长期排期为 Pro 功能" },
@@ -1170,7 +1171,9 @@ export default async (req: Request): Promise<Response> => {
       );
     }
   }
-  const quota = await consumeAiQuota(auth.id, "decompose");
+  const quota = await consumeAiQuota(auth.id, "decompose", {
+    testerMode: isTesterModeRequest(req),
+  });
   if (!quota.allowed) {
     return Response.json(
       { error: `今日 AI 拆解次数已用完（免费版每天 ${quota.limit} 次）` },

@@ -21,6 +21,7 @@ const KEY_REVIEWS = "stepup.reviews";
 const KEY_TASK_AI_REVIEWS = "stepup.taskAiReviews";
 const KEY_BACKLOG = "stepup.backlog";
 const KEY_PRO = "stepup.pro";
+const KEY_TESTER_MODE = "stepup.testerMode";
 const KEY_BACKLOG_PROMPT = "stepup.backlogPromptDate";
 const VERSION = 3;
 let workspaceSyncTimer: number | null = null;
@@ -58,6 +59,15 @@ export function configureStorageUser(userId: string | null): void {
 /** 生产环境由服务端 user_entitlements 注入；本地仍使用演示试用开关。 */
 export function configureProEntitlement(pro: boolean): void {
   serverProEntitlement = Boolean(pro);
+}
+
+export function isTesterModeEnabled(): boolean {
+  return localStorage.getItem(KEY_TESTER_MODE) === "true";
+}
+
+export function setTesterModeEnabled(value: boolean): void {
+  localStorage.setItem(KEY_TESTER_MODE, value ? "true" : "false");
+  window.dispatchEvent(new Event("stepup:tester-mode-change"));
 }
 
 type WorkspaceEnvelope = { v: number; workspace: Workspace };
@@ -184,7 +194,10 @@ async function syncWorkspaceToServer(workspace: Workspace): Promise<void> {
   try {
     const response = await fetch("/api/workspace", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(isTesterModeEnabled() ? { "X-StepUp-Tester-Mode": "true" } : {}),
+      },
       body: JSON.stringify({ action: "sync", workspace }),
     });
     if (!response.ok) throw new Error(`工作区同步失败 (${response.status})`);
@@ -630,6 +643,7 @@ const KEY_PRO_TRIAL_START = "stepup.proTrialStart";
 const TRIAL_DAYS = 7;
 
 export function isProUnlocked(): boolean {
+  if (isTesterModeEnabled()) return true;
   if (!import.meta.env.DEV) return serverProEntitlement;
   if (localStorage.getItem(KEY_PRO) !== "true") return false;
   // 检查试用期是否过期

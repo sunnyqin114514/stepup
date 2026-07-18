@@ -5,7 +5,7 @@ import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { createRequire } from "node:module";
 import { db } from "../../db";
 import { resources, taskResources, tasks } from "../../db/schema";
-import { createId, getEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
+import { createId, getRequestEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
 import { validatePublicUrl, validateUpload } from "./_shared/resourceValidation";
 
 // 直接加载 lib，避免 pdf-parse 入口在某些打包环境下误跑测试脚本导致 500
@@ -83,6 +83,7 @@ async function extractBufferText(buffer: Buffer, fileName: string, mimeType = ""
 
 async function persistUploadedFile(input: {
   userId: string;
+  pro: boolean;
   fileName: string;
   mimeType: string;
   sizeBytes: number;
@@ -97,8 +98,7 @@ async function persistUploadedFile(input: {
   });
   if (validation) return Response.json({ error: validation }, { status: 400 });
 
-  const entitlement = await getEntitlement(input.userId);
-  if (!entitlement.pro) {
+  if (!input.pro) {
     const existing = await db
       .select({ id: resources.id })
       .from(resources)
@@ -176,7 +176,7 @@ export default async (req: Request): Promise<Response> => {
           )
         : eq(resources.userId, auth.id);
       const items = await db.select().from(resources).where(condition).orderBy(desc(resources.updatedAt));
-      const entitlement = await getEntitlement(auth.id);
+      const entitlement = await getRequestEntitlement(auth.id, req);
       return Response.json({ resources: items, entitlement, freeLimit: FREE_RESOURCE_LIMIT });
     }
 
@@ -191,6 +191,7 @@ export default async (req: Request): Promise<Response> => {
           }
           return await persistUploadedFile({
             userId: auth.id,
+            pro: (await getRequestEntitlement(auth.id, req)).pro,
             fileName: file.name,
             mimeType: file.type,
             sizeBytes: file.size,
@@ -224,6 +225,7 @@ export default async (req: Request): Promise<Response> => {
         }
         return await persistUploadedFile({
           userId: auth.id,
+          pro: (await getRequestEntitlement(auth.id, req)).pro,
           fileName,
           mimeType: String(body.mimeType ?? ""),
           sizeBytes: buffer.byteLength,
@@ -297,7 +299,7 @@ export default async (req: Request): Promise<Response> => {
         }, { status: 201 });
       }
 
-      const entitlement = await getEntitlement(auth.id);
+      const entitlement = await getRequestEntitlement(auth.id, req);
       if (!entitlement.pro) {
         const existing = await db
           .select({ id: resources.id })

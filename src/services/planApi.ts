@@ -13,6 +13,14 @@ import type {
   ReviewScheduleItem,
   StructuredReviewReport,
 } from "../types/plan";
+import { isTesterModeEnabled } from "../lib/storage";
+
+function requestHeaders(): HeadersInit {
+  return {
+    "Content-Type": "application/json",
+    ...(isTesterModeEnabled() ? { "X-StepUp-Tester-Mode": "true" } : {}),
+  };
+}
 
 async function postJSON<T>(
   url: string,
@@ -25,7 +33,7 @@ async function postJSON<T>(
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: requestHeaders(),
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -49,7 +57,9 @@ async function postJSON<T>(
 
 async function getJSON<T>(url: string): Promise<T> {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: isTesterModeEnabled() ? { "X-StepUp-Tester-Mode": "true" } : {},
+    });
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       throw new Error(detail || `请求失败 (${response.status})`);

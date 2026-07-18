@@ -10,7 +10,7 @@ import {
   tasks,
 } from "../../db/schema";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
-import { createId, getEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
+import { createId, getRequestEntitlement, isAuthResponse, requireUser } from "./_shared/auth";
 import { normalizeIntervals } from "./_shared/resourceValidation";
 
 type ReviewJson = Pick<
@@ -187,7 +187,7 @@ moduleAccuracy 为模块名到 0-100 正确率；reinforcementTasks 为 1-4 条 
   }
 
   try {
-    const entitlement = await getEntitlement(auth.id);
+    const entitlement = await getRequestEntitlement(auth.id, req);
     if (!entitlement.pro) {
       review = { ...review, reinforcementTasks: review.reinforcementTasks.slice(0, 1) };
     }

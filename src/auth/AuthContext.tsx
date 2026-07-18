@@ -10,6 +10,7 @@ import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import {
   configureProEntitlement,
   configureStorageUser,
+  isTesterModeEnabled,
   isProUnlocked,
   loadReviews,
   loadTaskAiReviews,
@@ -18,6 +19,10 @@ import {
 } from "../lib/storage";
 import { syncDevProEntitlement } from "../services/planApi";
 import type { Workspace } from "../types/plan";
+
+function testerHeaders(): HeadersInit {
+  return isTesterModeEnabled() ? { "X-StepUp-Tester-Mode": "true" } : {};
+}
 
 export type AuthUser = { id: string; email?: string; name?: string; development?: boolean };
 
@@ -65,7 +70,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const retryMigration = async () => {
     try {
-      const status = await fetch("/api/workspace");
+      const status = await fetch("/api/workspace", { headers: testerHeaders() });
       if (!status.ok) throw new Error(`迁移状态读取失败 (${status.status})`);
       const data = (await status.json()) as {
         migrated?: boolean;
@@ -79,7 +84,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       const response = await fetch("/api/workspace", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...testerHeaders() },
         body: JSON.stringify({
           workspace: loadWorkspace(),
           reviews: loadReviews(),
@@ -90,7 +95,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const detail = (await response.json().catch(() => ({}))) as { error?: string };
         throw new Error(detail.error ?? `迁移失败 (${response.status})`);
       }
-      const refreshed = await fetch("/api/workspace");
+      const refreshed = await fetch("/api/workspace", { headers: testerHeaders() });
       if (refreshed.ok) {
         const snapshot = (await refreshed.json()) as {
           entitlement?: { pro?: boolean };

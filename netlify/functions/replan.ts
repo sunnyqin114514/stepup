@@ -15,7 +15,7 @@ import {
 } from "../../src/lib/scheduleDates";
 import { compactPlainText, stripMarkdown } from "../../src/lib/textSanitize";
 import { checkOrigin, createAiClient } from "./_shared/aiClient";
-import { consumeAiQuota, isAuthResponse, requireUser } from "./_shared/auth";
+import { consumeAiQuota, isAuthResponse, isTesterModeRequest, requireUser } from "./_shared/auth";
 
 function resolveBudget(req: ReplanRequest): number {
   const allocated = Number(req.allocatedDailyMinutes);
@@ -196,7 +196,9 @@ export default async (req: Request): Promise<Response> => {
   ) {
     return Response.json({ error: "缺少计划数据" }, { status: 400 });
   }
-  const quota = await consumeAiQuota(auth.id, "replan");
+  const quota = await consumeAiQuota(auth.id, "replan", {
+    testerMode: isTesterModeRequest(req),
+  });
   if (!quota.allowed) {
     return Response.json(
       { error: `今日 AI 重排次数已用完（免费版每天 ${quota.limit} 次）` },
